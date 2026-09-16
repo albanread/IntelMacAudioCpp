@@ -25,7 +25,9 @@ using namespace metal;
 
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
-#define N_SIMDWIDTH 32 // assuming SIMD group size is 32
+#ifndef N_SIMDWIDTH
+#define N_SIMDWIDTH 32 // SIMD group size - overridden via preprocessor macro for wave64 GPUs (e.g. AMD GCN)
+#endif
 
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //
@@ -6299,7 +6301,10 @@ kernel void kernel_flash_attn_ext_blk(
     const int32_t Q = FC_flash_attn_ext_blk_nqptg;
     const int32_t C = FC_flash_attn_ext_blk_ncpsg;
 
-    constexpr short NW  = N_SIMDWIDTH;
+    // note: the flash-attention kernels are not wave64-aware - they are pinned to the 32-lane
+    //       layout and the host disables FLASH_ATTN_EXT at runtime on wave64 devices.
+    //       on 32-wide devices this is identical to N_SIMDWIDTH.
+    constexpr short NW  = 32;
 
     const int32_t i3 = tgpig[2]/args.ne32;
     const int32_t i2 = tgpig[2]%args.ne32;
@@ -6432,7 +6437,10 @@ void kernel_flash_attn_ext_impl(
     constexpr short PV8  = PV/8;
   //constexpr short PV16 = PV/16;
 
-    constexpr short NW  = N_SIMDWIDTH;
+    // note: the flash-attention kernels are not wave64-aware - they are pinned to the 32-lane
+    //       layout and the host disables FLASH_ATTN_EXT at runtime on wave64 devices.
+    //       on 32-wide devices this is identical to N_SIMDWIDTH.
+    constexpr short NW  = 32;
     constexpr short NQ  = Q/NSG;
     constexpr short SH  = 2*C; // shared memory per simdgroup (s_t == float)
 
@@ -7292,7 +7300,10 @@ kernel void kernel_flash_attn_ext_vec(
     constexpr short PV  = PAD2(DV, 128);
     constexpr short PV4 = PV/4;
 
-    constexpr short NW  = N_SIMDWIDTH;
+    // note: the flash-attention kernels are not wave64-aware - they are pinned to the 32-lane
+    //       layout and the host disables FLASH_ATTN_EXT at runtime on wave64 devices.
+    //       on 32-wide devices this is identical to N_SIMDWIDTH.
+    constexpr short NW  = 32;
     constexpr short NL  = NW/NE; // note: this can be adjusted to support different head sizes and simdgroup work loads
     constexpr short SH  = 4*C;   // shared memory per simdgroup
 

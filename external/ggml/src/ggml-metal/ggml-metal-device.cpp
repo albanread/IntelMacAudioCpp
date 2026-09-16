@@ -1,5 +1,8 @@
 #include "ggml-metal-device.h"
 
+// SIMD group width of the library's device (32 on Apple Silicon, 64 on AMD GCN)
+#define GGML_METAL_NW(lib) (ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width)
+
 #include "ggml-metal-impl.h"
 
 #include "ggml-impl.h"
@@ -434,7 +437,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum_rows(ggml_me
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 32*sizeof(float);
+    res.smem = GGML_METAL_NW(lib)*sizeof(float);
 
     if (is_c4) {
         res.smem *= 4;
@@ -523,7 +526,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = 32*sizeof(float);
+    res.smem = GGML_METAL_NW(lib)*sizeof(float);
 
     return res;
 }
@@ -593,7 +596,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
     char base[256];
     char name[256];
 
-    const int nsg = (ne00 + 31)/32;
+    const int nsg = (ne00 + GGML_METAL_NW(lib) - 1)/GGML_METAL_NW(lib);
 
     snprintf(base, 256, "kernel_ssm_scan_%s", ggml_type_name(op->src[0]->type));
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
@@ -608,7 +611,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
     // - sgptg floats for shared_x_dt (nsg)
     // - sgptg floats for shared_dA (nsg)
     // Total: nsg * (32 + 2) floats
-    res.smem = (32 + 2)*sizeof(float)*nsg;
+    res.smem = (GGML_METAL_NW(lib) + 2)*sizeof(float)*nsg;
 
     return res;
 }
@@ -662,11 +665,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     // state is src[5], 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
     const int K = op->src[5]->ne[1];
 
-    const int nsg = op->src[2]->ne[0]/32;
+    const int nsg = op->src[2]->ne[0]/GGML_METAL_NW(lib);
 
     GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
-    GGML_ASSERT(ne20 % 32 == 0);
+    GGML_ASSERT(ne20 % GGML_METAL_NW(lib) == 0);
 
     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
     snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d", base, ne20, ne30, K);
@@ -714,7 +717,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_m
     }
 
     res.nsg  = nsg;
-    res.smem = GGML_PAD(GGML_PAD(n, 32)*nsg*sizeof(float), 16);
+    res.smem = GGML_PAD(GGML_PAD(n, GGML_METAL_NW(lib))*nsg*sizeof(float), 16);
 
     return res;
 }
@@ -838,16 +841,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
             {
-                if (ne00 < 32) {
+                if (ne00 < GGML_METAL_NW(lib)) {
                     nsg = 1;
-                    nr0 = 32;
+                    nr0 = GGML_METAL_NW(lib);
                     nr1 = 1;
                     suffix = "_short";
                 } else {
                     nsg = std::min(4, (ne00 + 127) / 128);
                     nr0 = 2;
                     nr1 = 1;
-                    smem = 32*sizeof(float)*nr0;
+                    smem = GGML_METAL_NW(lib)*sizeof(float)*nr0;
                     suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
             } break;
@@ -880,13 +883,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
-                smem = 32*sizeof(float)*N_R0_Q8_0;
+                smem = GGML_METAL_NW(lib)*sizeof(float)*N_R0_Q8_0;
             } break;
         case GGML_TYPE_MXFP4:
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
-                smem = 32*sizeof(float);
+                smem = GGML_METAL_NW(lib)*sizeof(float);
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -956,13 +959,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_IQ4_NL;
                 nr0 = N_R0_IQ4_NL;
-                smem = 32*sizeof(float);
+                smem = GGML_METAL_NW(lib)*sizeof(float);
             } break;
         case GGML_TYPE_IQ4_XS:
             {
                 nsg = N_SG_IQ4_XS;
                 nr0 = N_R0_IQ4_XS;
-                smem = 32*sizeof(float);
+                smem = GGML_METAL_NW(lib)*sizeof(float);
             } break;
         default:
             {
@@ -1072,7 +1075,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = std::min(4, (ne00 + 127) / 128);
                 nr0 = 2;
                 nr1 = 1;
-                smem = 32*sizeof(float)*nr0;
+                smem = GGML_METAL_NW(lib)*sizeof(float)*nr0;
                 suffix = ne00 % 4 == 0 ? "_4" : "";
             } break;
         case GGML_TYPE_Q1_0:
@@ -1104,13 +1107,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
-                smem = 32*sizeof(float)*N_R0_Q8_0;
+                smem = GGML_METAL_NW(lib)*sizeof(float)*N_R0_Q8_0;
             } break;
         case GGML_TYPE_MXFP4:
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
-                smem = 32*sizeof(float);
+                smem = GGML_METAL_NW(lib)*sizeof(float);
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -1180,13 +1183,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_IQ4_NL;
                 nr0 = N_R0_IQ4_NL;
-                smem = 32*sizeof(float);
+                smem = GGML_METAL_NW(lib)*sizeof(float);
             } break;
         case GGML_TYPE_IQ4_XS:
             {
                 nsg = N_SG_IQ4_XS;
                 nr0 = N_R0_IQ4_XS;
-                smem = 32*sizeof(float);
+                smem = GGML_METAL_NW(lib)*sizeof(float);
             } break;
         default:
             {
@@ -1236,7 +1239,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_meta
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = 32*(sizeof(float) + sizeof(int32_t));
+    res.smem = GGML_METAL_NW(lib)*(sizeof(float) + sizeof(int32_t));
 
     return res;
 }
@@ -1721,7 +1724,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_met
     }
 
     res.c4   = is_c4;
-    res.smem = 32*sizeof(float);
+    res.smem = GGML_METAL_NW(lib)*sizeof(float);
 
     return res;
 }
@@ -1742,7 +1745,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = 32*sizeof(float);
+    res.smem = GGML_METAL_NW(lib)*sizeof(float);
 
     return res;
 }
@@ -1785,7 +1788,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = 32*sizeof(float);
+    res.smem = GGML_METAL_NW(lib)*sizeof(float);
 
     return res;
 }
@@ -2219,7 +2222,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
     char name[256];
 
     int nsg = 1;
-    while (32*nsg < ne00 && nsg < 32) {
+    while (GGML_METAL_NW(lib)*nsg < ne00 && GGML_METAL_NW(lib)*nsg < 1024) {
         nsg *= 2;
     }
 
@@ -2237,7 +2240,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 32 * sizeof(int32_t);
+    res.smem = GGML_METAL_NW(lib) * sizeof(int32_t);
     res.nsg  = nsg;
 
     return res;

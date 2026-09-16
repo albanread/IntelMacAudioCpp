@@ -1,5 +1,9 @@
 #include "ggml-metal-ops.h"
 
+// SIMD group width of the device (32 on Apple Silicon, 64 on AMD GCN).
+// closes over the local `ctx` - only valid inside ggml_metal_op_* functions.
+#define GGML_METAL_NW (ggml_metal_device_get_props(ctx->dev)->simd_width)
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -1014,7 +1018,7 @@ int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_sum(lib, op);
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
 
     while (nth < (int) n && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -1079,7 +1083,7 @@ int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) {
         args.ne0  = ne0/4;
     }
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
 
     while (nth < args.ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -1134,7 +1138,7 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     const uint64_t nbt2 = net1*nbt1;
     const uint64_t nbt3 = net2*nbt2;
 
-    const size_t smem = GGML_PAD(32*sizeof(float), 16);
+    const size_t smem = GGML_PAD(GGML_METAL_NW*sizeof(float), 16);
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
@@ -1307,7 +1311,7 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
 
     const int32_t nk0 = ne0/ggml_blck_size(op->type);
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
 
     while (nth < nk0 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -1389,7 +1393,7 @@ int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         2);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, 32, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, GGML_METAL_NW, 1, 1);
 
     return 1;
 }
@@ -1493,7 +1497,7 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_soft_max(lib, op);
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
 
     if (ne00%4 == 0) {
         while (nth < ne00/4 && nth*ne01*ne02*ne03 < 256) {
@@ -1811,7 +1815,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     const int nsg = pipeline.nsg;
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], GGML_METAL_NW, nsg, 1);
 
     return 1;
 }
@@ -1868,7 +1872,7 @@ int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne10 + nsg - 1)/nsg, ne02, ne03, 32, nsg, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne10 + nsg - 1)/nsg, ne02, ne03, GGML_METAL_NW, nsg, 1);
 
     return 1;
 }
@@ -2315,7 +2319,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nxpsg = 4;
         }
 
-        const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
+        const int16_t nypsg  = GGML_METAL_NW/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
         const int16_t r0ptg  = nypsg*nsg;         // num src0 rows per threadgroup
               int16_t r1ptg  = 4;                 // num src1 rows per threadgroup
 
@@ -2365,7 +2369,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + r0ptg - 1)/r0ptg), ((ne11 + r1ptg - 1)/r1ptg), ne12*ne13, GGML_METAL_NW, nsg, 1);
     } else if (
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
@@ -2416,7 +2420,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, GGML_METAL_NW, nsg, 1);
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
@@ -2460,9 +2464,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             op->src[0]->type == GGML_TYPE_F16 ||
             op->src[0]->type == GGML_TYPE_BF16 ||
             op->src[0]->type == GGML_TYPE_Q8_0) {
-            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 - 1)/(nr0)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 - 1)/(nr0)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, GGML_METAL_NW, nsg, 1);
         } else {
-            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, GGML_METAL_NW, nsg, 1);
         }
     }
 
@@ -2665,9 +2669,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             op->src[0]->type == GGML_TYPE_F16 ||
             op->src[0]->type == GGML_TYPE_BF16 ||
             op->src[0]->type == GGML_TYPE_Q8_0) {
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, GGML_METAL_NW, nsg, 1);
         } else {
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, GGML_METAL_NW, nsg, 1);
         }
     }
 
@@ -3538,7 +3542,7 @@ int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
         args.ne0  = ne0/4;
     }
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
 
     while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -3589,7 +3593,7 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_group_norm(lib, op);
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
     //while (nth < ne00/4 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
     //    nth *= 2;
     //}
@@ -3724,7 +3728,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_norm(lib, op, n_fuse);
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
 
     while (nth < args.ne00_t && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -4648,7 +4652,7 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
 
     const int64_t nrows = ggml_nrows(op->src[0]);
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
     while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
         nth *= 2;
     }
@@ -4918,7 +4922,7 @@ int ggml_metal_op_tri(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_tri(lib, op);
 
-    int nth = 32; // SIMD width
+    int nth = GGML_METAL_NW; // SIMD width
 
     while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -5051,7 +5055,7 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
 
         const size_t smem = pipeline.smem;
 
-        const int nth = 32*pipeline.nsg;
+        const int nth = GGML_METAL_NW*pipeline.nsg;
 
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 

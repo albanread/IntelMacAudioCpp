@@ -244,6 +244,16 @@ struct ggml_metal_device_props {
 
     bool supports_gpu_family_apple7;
 
+    // the number of threads that execute in lockstep in one SIMD group, probed at device init.
+    // Apple GPUs are 32-wide; AMD GCN/RDNA parts under macOS report 64. the shader library is
+    // compiled with N_SIMDWIDTH set to this value and the host must size every threadgroup
+    // allocation and dispatch that talks about "a SIMD group" from it.
+    int simd_width;
+
+    // wave64 devices have no simdgroup_matrix support, so they get the register-tiled
+    // kernel_mul_mm_w64 instead of kernel_mul_mm
+    bool has_mm_w64;
+
     int op_offload_min_batch_size;
 };
 

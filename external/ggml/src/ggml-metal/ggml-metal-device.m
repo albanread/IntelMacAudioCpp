@@ -262,6 +262,11 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                     [prep setObject:@"1" forKey:@"GGML_METAL_HAS_TENSOR"];
                 }
 
+                // compile the kernels for the SIMD group width this device actually executes.
+                // ggml-metal.metal defaults to 32 when this is not supplied, so Apple silicon is unchanged
+                [prep setObject:[NSString stringWithFormat:@"%d", ggml_metal_device_get_props(dev)->simd_width]
+                         forKey:@"N_SIMDWIDTH"];
+
 #if GGML_METAL_EMBED_LIBRARY
                 [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
 #endif
@@ -322,6 +327,9 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
 
     @autoreleasepool {
         NSMutableDictionary * prep = [NSMutableDictionary dictionary];
+
+        [prep setObject:[NSString stringWithFormat:@"%d", ggml_metal_device_get_props(dev)->simd_width]
+                 forKey:@"N_SIMDWIDTH"];
 
         MTLCompileOptions * options = [MTLCompileOptions new];
         options.preprocessorMacros = prep;
@@ -730,10 +738,54 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->addr_virt = 0x000000400ULL;
 
             dev->props.device = device;
+
+            // determine the SIMD group width by compiling a trivial kernel and asking the PSO.
+            // Apple GPUs report 32, AMD GCN parts report 64 - the shader library is then compiled
+            // with a matching N_SIMDWIDTH so the lane -> data mapping in every kernel is correct.
+            // GGML_METAL_SIMD_WIDTH overrides the probe, for A/B against the old hardcoded 32.
+            dev->props.simd_width = 32;
+            {
+                NSError * perror = nil;
+
+                id<MTLLibrary> plib = [dev->mtl_device newLibraryWithSource:@"kernel void ggml_probe(device float * dst [[buffer(0)]], uint tpig [[thread_position_in_grid]]) { dst[tpig] = 0.0f; }"
+                                                                    options:nil
+                                                                      error:&perror];
+                if (plib) {
+                    id<MTLFunction> pfun = [plib newFunctionWithName:@"ggml_probe"];
+                    if (pfun) {
+                        id<MTLComputePipelineState> pps = [dev->mtl_device newComputePipelineStateWithFunction:pfun error:&perror];
+                        if (pps) {
+                            dev->props.simd_width = (int) pps.threadExecutionWidth;
+                            [pps release];
+                        }
+                        [pfun release];
+                    }
+                    [plib release];
+                }
+
+                if (getenv("GGML_METAL_SIMD_WIDTH") != NULL) {
+                    const int w = atoi(getenv("GGML_METAL_SIMD_WIDTH"));
+                    if (w == 32 || w == 64) {
+                        GGML_LOG_WARN("%s: GGML_METAL_SIMD_WIDTH=%d overrides the probed width of %d\n", __func__, w, dev->props.simd_width);
+                        dev->props.simd_width = w;
+                    } else {
+                        GGML_LOG_WARN("%s: ignoring GGML_METAL_SIMD_WIDTH=%d - only 32 and 64 are supported\n", __func__, w);
+                    }
+                }
+            }
+
             dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
             dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
 
             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+
+            // wave64 GPUs have no simdgroup_matrix support, so they get the register-tiled
+            // kernel_mul_mm_w64 instead. GGML_METAL_MM_W64_DISABLE falls back to the mat-vec path.
+            dev->props.has_mm_w64 = (dev->props.simd_width == 64);
+            if (getenv("GGML_METAL_MM_W64_DISABLE") != NULL) {
+                dev->props.has_mm_w64 = false;
+            }
+
             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
             dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
@@ -935,6 +987,8 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             GGML_LOG_INFO("%s: simdgroup reduction   = %s\n", __func__, dev->props.has_simdgroup_reduction ? "true" : "false");
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
+            GGML_LOG_INFO("%s: simd group width      = %d\n", __func__, dev->props.simd_width);
+            GGML_LOG_INFO("%s: wave64 mat-mul        = %s\n", __func__, dev->props.has_mm_w64             ? "true" : "false");
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
             GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");
