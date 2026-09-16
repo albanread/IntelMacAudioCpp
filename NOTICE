@@ -1,0 +1,60 @@
+IntelMacAudioCpp
+================
+
+This repository is a fork of audio.cpp:
+
+    https://github.com/0xShug0/audio.cpp
+    Copyright 2026 ShugoAI LLC
+    Licensed under the Apache License, Version 2.0 (see LICENSE)
+
+It vendors ggml at external/ggml:
+
+    Copyright (c) 2023-2026 The ggml authors
+    MIT License (see external/ggml/LICENSE)
+
+Both upstream licenses are unchanged and apply to this fork. Modifications in
+this fork are made available under the same terms as the files they modify.
+
+MODIFICATIONS
+-------------
+
+As required by Apache License 2.0 section 4(b), the following files have been
+changed from their upstream versions. All changes exist to make the ggml Metal
+backend work on AMD GCN GPUs, which execute 64-wide wavefronts, where upstream
+assumes 32-wide Apple simdgroups.
+
+Under external/ggml/ (MIT, The ggml authors):
+
+    src/ggml-metal/ggml-metal.metal
+    src/ggml-metal/ggml-metal-device.m
+    src/ggml-metal/ggml-metal-device.cpp
+    src/ggml-metal/ggml-metal-ops.cpp
+
+        - runtime SIMD-width probe; N_SIMDWIDTH injected at both
+          MTLCompileOptions sites instead of being hardcoded to 32
+        - GGML_METAL_DEVICE selects a GPU by name or index, so a headless
+          compute card can be used instead of the display GPU
+        - wave-width-generic lane -> block mapping in the mat-vec kernels
+        - kernel_mul_mm_w64: a register-tiled GEMM for GPUs without
+          simdgroup_matrix support
+        - concurrent dispatch restricted to Apple-family GPUs
+        - correctness fixes at 64-wide: GGML_OP_SUM reduction count, iq-quant
+          mat-vec threadgroup bounds, GATED_DELTA_NET shape admission
+        - runtime dials: GGML_METAL_MM_W64_DISABLE, GGML_METAL_MM_MIN,
+          GGML_METAL_MM_ID_MIN, GGML_METAL_N_CB, GGML_METAL_CONCURRENCY_ENABLE
+
+Under src/ (Apache 2.0, ShugoAI LLC):
+
+    src/framework/modules/transformers/qwen_decoder.cpp
+    src/models/yue2/nar_runtime.cpp
+
+        - AUDIOCPP_DISABLE_FLASH_ATTN takes the explicit attention paths these
+          files already carry. FLASH_ATTN_EXT is gated on simdgroup_matrix
+          support and aborts rather than falling back, so without this the run
+          dies on AMD.
+
+New files added by this fork carry no upstream copyright:
+
+    safe-sweep.sh
+    NOTICE
+    README.md          (the upstream README is preserved as README-upstream.md)

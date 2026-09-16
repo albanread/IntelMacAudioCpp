@@ -51,3 +51,10 @@ docs/FALCON_H1_0.1B_PORT_PLAN.md
 # --- leftovers from patch(1): backups and rejected hunks, never committed ---
 *.orig
 *.rej
+
+# --- IntelMacAudioCpp fork: local measurement artefacts ---
+# deliberately narrow: upstream tracks .wav under assets/ and we must not shadow it
+/sweep-logs*/
+/results/
+/build-metal.log
+*.air
