@@ -2285,7 +2285,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    const int ne11_mm_min = props_dev->mm_min;
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
@@ -2550,7 +2550,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     // ne20 = n_used_experts
     // ne21 = n_rows (batch size)
-    const int ne21_mm_id_min = 32;
+    const int ne21_mm_id_min = props_dev->mm_id_min;
 
     if (props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
         // some Metal matrix data types require aligned pointers

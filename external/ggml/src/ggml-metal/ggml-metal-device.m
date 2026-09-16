@@ -786,6 +786,12 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 dev->props.has_mm_w64 = false;
             }
 
+            // mat-vec -> mat-mul crossover. 8 and 32 are the upstream defaults, tuned on Apple
+            // GPUs; on this card the fork measured batching only becoming cheap above ~32, so
+            // these want sweeping per device rather than inheriting.
+            dev->props.mm_min    = getenv("GGML_METAL_MM_MIN")    ? atoi(getenv("GGML_METAL_MM_MIN"))    : 8;
+            dev->props.mm_id_min = getenv("GGML_METAL_MM_ID_MIN") ? atoi(getenv("GGML_METAL_MM_ID_MIN")) : 32;
+
             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
             dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
@@ -989,6 +995,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
             GGML_LOG_INFO("%s: simd group width      = %d\n", __func__, dev->props.simd_width);
             GGML_LOG_INFO("%s: wave64 mat-mul        = %s\n", __func__, dev->props.has_mm_w64             ? "true" : "false");
+            GGML_LOG_INFO("%s: mat-mul min batch     = %d (id: %d)\n", __func__, dev->props.mm_min, dev->props.mm_id_min);
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
             GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");

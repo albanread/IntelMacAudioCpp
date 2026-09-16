@@ -254,6 +254,12 @@ struct ggml_metal_device_props {
     // kernel_mul_mm_w64 instead of kernel_mul_mm
     bool has_mm_w64;
 
+    // the src1 batch size above which MUL_MAT / MUL_MAT_ID take the mat-mul kernel instead of
+    // the mat-vec one. the defaults are Apple's; the crossover sits elsewhere on other hardware,
+    // so they are dials rather than constants (GGML_METAL_MM_MIN / GGML_METAL_MM_ID_MIN).
+    int mm_min;
+    int mm_id_min;
+
     int op_offload_min_batch_size;
 };
 

@@ -13,6 +13,21 @@
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
 
+// how many command buffers one graph is split across.
+//
+// the default of 1 puts an entire graph into a single command buffer, which the GPU watchdog
+// kills at ~40 s. on this machine that is not merely a failed generation: both GPUs share the
+// IOAcceleratorFamily2 driver, so a hang on the headless compute card stalls the one driving
+// the display and the watchdog takes WindowServer with it. splitting a long graph gives each
+// piece its own timeout. clamped to GGML_METAL_MAX_COMMAND_BUFFERS (8) by ggml_metal_set_n_cb.
+static int ggml_backend_metal_n_cb_default(void) {
+    const char * env = getenv("GGML_METAL_N_CB");
+
+    const int n_cb = env ? atoi(env) : 1;
+
+    return n_cb < 1 ? 1 : n_cb;
+}
+
 // number of Metal devices
 // note: can be overridden with GGML_METAL_DEVICES env to simulate virtual devices
 static int g_devices = 1;
@@ -608,7 +623,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_n_cb_default());
 
     return backend;
 }
@@ -702,7 +717,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_n_cb_default());
 
     return backend;
 
