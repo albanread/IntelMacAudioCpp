@@ -767,11 +767,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
 
-    const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
+    const struct ggml_metal_device_props * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
 
+    const bool has_tensor = props->has_tensor;
+
+    // wave64 devices have no simdgroup_matrix, so they get the register-tiled GEMM instead
+    const bool use_w64 = !has_tensor && props->has_mm_w64;
+
+    // note: the w64 kernel bounds-checks every tile edge itself, so it has no bc_out variant
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
-        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+        : (!use_w64 && (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0));
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -779,7 +785,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    snprintf(base, 256, use_w64 ? "kernel_mul_mm_w64_%s_%s" : "kernel_mul_mm_%s_%s",
+             ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -796,6 +803,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
+        // note: there is deliberately no fallback to kernel_mul_mm here. on wave64 hardware the
+        //       simdgroup_matrix kernel does not merely underperform, it fails at PIPELINE
+        //       CREATION ("call to an undefined label"), so silently degrading is not an option.
+        //       ggml_metal_mul_mm_w64_supported() in ggml-metal-ops.cpp keeps types without a
+        //       w64 variant on the mat-vec path, so reaching this assert means those two lists
+        //       have drifted apart.
+        GGML_ASSERT((res.pipeline || !use_w64) && "missing wave64 mat-mul variant for this type pair");
+
         ggml_metal_cv_free(cv);
     }
 
@@ -805,6 +820,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
+    } else if (use_w64) {
+        // MM_W64_NR0 rows x 16*MM_W64_TN cols of C per threadgroup. these must match the
+        // single instantiation in ggml-metal.metal (NK = 32, TN = 2 -> a 64 x 32 tile)
+        res.nr0 = 64;
+        res.nr1 = 32;
+
+        // NK*64 staged A elements + NK*NR1 staged B elements, both half
+        res.smem = (size_t) 32*(64 + 32)*sizeof(ggml_fp16_t);
     } else {
         res.nr0 = 64;
         res.nr1 = 32;

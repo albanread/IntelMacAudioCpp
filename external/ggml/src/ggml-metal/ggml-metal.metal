@@ -10945,6 +10945,199 @@ template [[host_name("kernel_mul_mm_iq1_m_f16")]]   kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_iq4_nl_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_nl,  2,     dequantize_iq4_nl,  float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  half, half2x4>;
 
+// ---------------------------------------------------------------------------------------
+// wave64 matrix-matrix multiply, for GPUs without simdgroup_matrix (AMD GCN on macOS).
+//
+// simdgroup_matrix is gated on MTLGPUFamilyApple7, so on these cards ggml falls back to
+// mat-vec kernels for prompt processing - one output column at a time. That is why prefill
+// runs at a fraction of the card's fp32 peak and why speculative decoding is unprofitable
+// (verifying K drafted tokens costs ~Kx instead of ~1x).
+//
+// This is a plain register-tiled GEMM: stage A and B in threadgroup memory, accumulate in
+// registers. No matrix intrinsics, so it works anywhere, and the 64-wide wavefront is used
+// simply as 64 independent lanes.
+//
+//   threadgroup : 4 simdgroups x 64 lanes = 256 threads
+//   tile        : 64 (M) x 16*TN (N), stepping K in chunks of NK
+//   per thread  : 4 (M) x TN (N) accumulators in registers
+//
+// NK and TN are template parameters and the staging loops are written generically over
+// both, so the dials the fork sweeps are available - but this backend instantiates a single
+// setting (NK=32, TN=2 => a 64x32 tile) because the shader library is recompiled from source
+// at every device init and every extra variant is paid on every CLI invocation.
+//
+// Threadgroup layout is chosen for the inner loop: sa is k-major so each thread reads its
+// 4 rows as one half4, sb is k-major so its TN columns are one vector load.
+// ---------------------------------------------------------------------------------------
+
+#define MM_W64_NR0 64               // rows of C per threadgroup (M)
+#define MM_W64_TM   4               // rows per thread
+#define MM_W64_NR1 (16*MM_W64_TN)   // cols of C per threadgroup (N)
+
+template<
+    typename S0, typename S0_4x4,
+    typename S1,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
+    typename T0, typename T0_4x4, typename T1,
+    short MM_W64_NK, short MM_W64_TN, short MM_W64_UR>
+kernel void kernel_mul_mm_w64(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);                       // [MM_W64_NK][64]
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + MM_W64_NR0*MM_W64_NK*sizeof(S0)); // [MM_W64_NK][32]
+
+    const int K  = args.ne00;
+    const int M  = args.ne0;
+    const int N  = args.ne1;
+
+    const int im  = tgpig.z;
+    const int r0  = tgpig.y*MM_W64_NR0;
+    const int r1  = tgpig.x*MM_W64_NR1;
+
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
+
+    // this thread's 4x2 patch of the output tile
+    const short tm = (tiitg % 16) * MM_W64_TM;   // 0,4,..,60
+    const short tn = (tiitg / 16) * MM_W64_TN;   // 0,2,..,30
+
+    float acc[MM_W64_TM][MM_W64_TN];
+    FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) {
+        FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    // note: the staging addresses and bounds are recomputed inside the loop on purpose -
+    // keeping pointers live across the accumulate phase raises the kernel-wide register
+    // count and halves occupancy on the K-quants
+    for (int loop_k = 0; loop_k < K; loop_k += MM_W64_NK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- stage A: 64 rows x NK k. Each dequantize call yields 16 k; a thread
+        //     covers the NK/32 chunks of one row that match its parity.
+        if (tiitg < 128) {
+            const short row   = tiitg / 2;              // 0..63
+            const short parity = tiitg % 2;
+
+            const int  gr = r0 + row;
+            const bool row_ok = gr < M;
+
+            device const char * rowp = src0 + args.nb01*gr + offset0;
+
+            FOR_UNROLL (short chunk = parity; chunk < MM_W64_NK/16; chunk += 2) {
+                const int k_pos = loop_k + chunk*16;
+
+                S0 vals[16];
+
+                if (!row_ok) {
+                    FOR_UNROLL (short i = 0; i < 16; ++i) vals[i] = (S0) 0;
+                } else if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+                    // unquantised A with K not a multiple of 32: nb01 may leave 4x4 loads
+                    // misaligned, so read elementwise
+                    device const T0 * rp = (device const T0 *)(rowp);
+                    FOR_UNROLL (short i = 0; i < 16; ++i) {
+                        vals[i] = (k_pos + i < K) ? (S0) rp[k_pos + i] : (S0) 0;
+                    }
+                } else {
+                    const int   blk = k_pos / (16*nl);
+                    const short il  = (k_pos / 16) % nl;
+
+                    S0_4x4 tmp;
+                    dequantize_func((device const block_q *)(rowp) + blk, il, tmp);
+
+                    FOR_UNROLL (short i = 0; i < 16; ++i) {
+                        vals[i] = (k_pos + i < K) ? (S0) tmp[i/4][i%4] : (S0) 0;
+                    }
+                }
+
+                FOR_UNROLL (short i = 0; i < 16; ++i) {
+                    sa[(chunk*16 + i)*MM_W64_NR0 + row] = vals[i];
+                }
+            }
+        } else {
+            // --- stage B: NK k x NR1 n, 128 threads; each covers the NK*NR1/128
+            //     values of one column, contiguous in k
+            const short t  = tiitg - 128;
+            const int   v0 = t*(MM_W64_NK*MM_W64_NR1/128);
+
+            const short n  = v0 / MM_W64_NK;
+            const short k0 = v0 % MM_W64_NK;
+
+            const int  gc = r1 + n;
+            const bool col_ok = gc < N;
+
+            device const T1 * y = (device const T1 *)(src1
+                    + args.nb13*i13
+                    + args.nb12*i12
+                    + args.nb11*gc);
+
+            FOR_UNROLL (short i = 0; i < MM_W64_NK*MM_W64_NR1/128; ++i) {
+                const int k = loop_k + k0 + i;
+                sb[(k0 + i)*MM_W64_NR1 + n] = (col_ok && k < K) ? (S1) y[k] : (S1) 0;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --- accumulate this K chunk; the unroll factor is a dial (w64_unroll):
+        //     lower factors shrink the live set across the loop, trading loop overhead
+        #pragma clang loop unroll_count(MM_W64_UR)
+        for (short k = 0; k < MM_W64_NK; ++k) {
+            S0 a[MM_W64_TM];
+            S1 b[MM_W64_TN];
+
+            FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) a[i] = sa[k*MM_W64_NR0 + tm + i];
+            FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) b[j] = sb[k*MM_W64_NR1 + tn + j];
+
+            FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) {
+                FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) {
+                    acc[i][j] = fma((float) a[i], (float) b[j], acc[i][j]);
+                }
+            }
+        }
+    }
+
+    // --- write out
+    device float * C = (device float *) dst + im*N*(size_t)M;
+
+    FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) {
+        const int gc = r1 + tn + j;
+        if (gc >= N) continue;
+
+        FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) {
+            const int gr = r0 + tm + i;
+            if (gr >= M) continue;
+
+            C[gr + (size_t)gc*M] = acc[i][j];
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_w64<half, half4x4, half, float4x4, 1, dequantize_f32, float, float4x4, float, 32, 2, 32>) mul_mm_w64_t;
+
+// note: only the type combinations this backend actually routes to the w64 path are
+//       instantiated - see ggml_metal_mul_mm_w64_supported() in ggml-metal-ops.cpp, which must
+//       be kept in step with this list. a combination missing from both simply keeps the
+//       mat-vec path it uses today; a combination that reaches get_pipeline_mul_mm without a
+//       variant here asserts, because there is no falling back to kernel_mul_mm on wave64
+//       hardware (it fails at pipeline creation, not at library compile).
+template [[host_name("kernel_mul_mm_w64_f32_f32")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, float4x4,   1, dequantize_f32,  float, float4x4, float, 32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_f16_f32")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, half4x4,    1, dequantize_f16,  half,  half4x4,  float, 32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_q8_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, 32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_f32_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, float4x4,   1, dequantize_f32,  float, float4x4, half,  32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_f16_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, half4x4,    1, dequantize_f16,  half,  half4x4,  half,  32, 2, 32>;
+
 //
 // indirect matrix-matrix multiplication
 //

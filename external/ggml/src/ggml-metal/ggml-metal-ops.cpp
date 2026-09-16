@@ -2242,6 +2242,24 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// which type pairs the wave64 mat-mul has a kernel for.
+//
+// the fork instantiates all 51 combinations x 10 dial settings; this backend compiles the
+// shader library from source at every device init, so it ships only the combinations it
+// actually uses (see the instantiation list next to kernel_mul_mm_w64 in ggml-metal.metal -
+// the two must be kept in step). anything not listed keeps the mat-vec path it has today
+// rather than reaching the missing-variant assert in get_pipeline_mul_mm.
+static bool ggml_metal_mul_mm_w64_supported(ggml_type tsrc0, ggml_type tsrc1) {
+    switch (tsrc1) {
+        case GGML_TYPE_F32:
+            return tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16 || tsrc0 == GGML_TYPE_Q8_0;
+        case GGML_TYPE_F16:
+            return tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16;
+        default:
+            return false;
+    }
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2373,9 +2391,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     } else if (
         !ggml_is_transposed(op->src[0]) &&
         !ggml_is_transposed(op->src[1]) &&
-        // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
-        // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
+        // the simdgroup_matrix mat-mul kernel only works on A14+/M1+ SoCs; wave64 GPUs take
+        // kernel_mul_mm_w64 instead, and older A-chips still fall through to the mat-vec path
+        (props_dev->has_simdgroup_mm ||
+         (props_dev->has_mm_w64 && ggml_metal_mul_mm_w64_supported(op->src[0]->type, op->src[1]->type))) &&
+        ne00 >= 64 && ne11 > ne11_mm_min) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers
@@ -2413,6 +2433,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         const size_t smem = pipeline.smem;
+
+        GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
