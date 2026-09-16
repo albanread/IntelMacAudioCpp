@@ -239,7 +239,18 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
         return true;
     }
 
-    ggml_metal_encoder_memory_barrier(ctx->enc);
+    // the barrier only means anything under concurrent dispatch. with use_concurrency == false
+    // ggml_metal_encoder_init creates the encoder with plain -computeCommandEncoder, i.e.
+    // MTLDispatchTypeSerial, and the serial dispatch type already orders every dispatch against
+    // the one before it and makes its writes visible. emitting memoryBarrierWithScope per node on
+    // top of that is pure encode overhead.
+    //
+    // the range bookkeeping is kept either way: ggml_mem_ranges_reset is what bounds the list that
+    // ggml_metal_op_concurrency_check walks, so skipping it would make the host encode slower, not
+    // faster.
+    if (ctx->use_concurrency) {
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+    }
 
     ggml_mem_ranges_reset(ctx->mem_ranges);
 
