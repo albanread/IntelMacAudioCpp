@@ -3475,8 +3475,11 @@ void mul_vec_q_n_f32_impl(
 
     float sumf[NR0] = {0.f};
 
-    const short ix = (tiisg/(NW/NQ));
-    const short il = (tiisg%(NW/NQ))*8;
+    constexpr short NTPB = 2;       // threads per block - each thread handles half a block
+    constexpr short NBP  = NW/NTPB; // blocks covered by one simdgroup pass
+
+    const short ix = tiisg/NTPB;
+    const short il = (tiisg%NTPB)*8;
 
     //const int ib0 = sgitg*NQ + ix;
     const int ib0 = ix;
@@ -3488,7 +3491,7 @@ void mul_vec_q_n_f32_impl(
 
     // each thread in a SIMD group deals with half a block.
     //for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-    for (int ib = ib0; ib < nb; ib += NQ) {
+    for (int ib = ib0; ib < nb; ib += NBP) {
         float sumy[2] = { 0.f, 0.f };
 
         FOR_UNROLL (short i = 0; i < 8; i += 2) {
@@ -3505,7 +3508,7 @@ void mul_vec_q_n_f32_impl(
             sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
         }
 
-        yb += QK4_0 * 16;
+        yb += QK4_0 * NBP;
         //yb += NSG*NQ*QK4_0;
     }
 
@@ -3689,17 +3692,20 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = tiisg/(NW/NQ);
-    const short il = tiisg%(NW/NQ);
+    constexpr short NTPB = QK8_0/NQ; // threads per block
+    constexpr short NBP  = NW/NTPB;  // blocks covered by one simdgroup pass
 
-    const int ib0 = sgitg*NQ + ix;
+    const short ix = tiisg/NTPB;
+    const short il = tiisg%NTPB;
+
+    const int ib0 = sgitg*NBP + ix;
 
     float yl[NQ];
 
     device const float * yb = y + ib0*QK8_0 + il*NQ;
 
     // each thread in a SIMD group deals with NQ quants at a time
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+    for (int ib = ib0; ib < nb; ib += NSG*NBP) {
         for (short i = 0; i < NQ; ++i) {
             yl[i] = yb[i];
         }
@@ -3715,7 +3721,7 @@ void kernel_mul_mv_q8_0_f32_impl(
             sumf[row] += sumq*ax[row][ib].d;
         }
 
-        yb += NSG*NQ*QK8_0;
+        yb += NSG*NBP*QK8_0;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -3753,7 +3759,7 @@ void kernel_mul_mv_ext_q4_f32_impl(
     const short chpt = 4; // chunks per thread
 
   //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (N_SIMDWIDTH/nxpsg);
 
     const short tx = tiisg%nxpsg;
     const short ty = tiisg/nxpsg;
@@ -3856,7 +3862,7 @@ void kernel_mul_mv_ext_q4x4_f32_impl(
     const short chpt = 1;
 
   //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (N_SIMDWIDTH/nxpsg);
 
     const short tx = tiisg%nxpsg;
     const short ty = tiisg/nxpsg;
@@ -4099,16 +4105,19 @@ void kernel_mul_mv_t_t_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = tiisg/(NW/NF);
-    const short il = tiisg%(NW/NF);
+    constexpr short NTPB = NB/NF;   // threads per block
+    constexpr short NBP  = NW/NTPB; // blocks covered by one simdgroup pass
 
-    const int ib0 = sgitg*NF + ix;
+    const short ix = tiisg/NTPB;
+    const short il = tiisg%NTPB;
+
+    const int ib0 = sgitg*NBP + ix;
 
     T1 yl[NF];
 
     device const T1 * yb = y + (ib0*NB + il*NF);
 
-    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+    for (int ib = ib0; ib < nb; ib += NSG*NBP) {
         for (short i = 0; i < NF; ++i) {
             yl[i] = yb[i];
         }
@@ -4124,7 +4133,7 @@ void kernel_mul_mv_t_t_impl(
             sumf[row] += sumq;
         }
 
-        yb += NSG*NF*NW;
+        yb += NSG*NBP*NB;
     }
 
     for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
@@ -4223,16 +4232,19 @@ void kernel_mul_mv_t_t_4_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = tiisg/(NW/NF);
-    const short il = tiisg%(NW/NF);
+    constexpr short NTPB = NB/NF;   // threads per block
+    constexpr short NBP  = NW/NTPB; // blocks covered by one simdgroup pass
 
-    const int ib0 = sgitg*NF + ix;
+    const short ix = tiisg/NTPB;
+    const short il = tiisg%NTPB;
+
+    const int ib0 = sgitg*NBP + ix;
 
     T14 yl4[NF4];
 
     device const T14 * yb4 = y4 + (ib0*NB + il*NF)/4;
 
-    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+    for (int ib = ib0; ib < nb; ib += NSG*NBP) {
         for (short i = 0; i < NF4; ++i) {
             yl4[i] = yb4[i];
         }
@@ -4248,7 +4260,7 @@ void kernel_mul_mv_t_t_4_impl(
             sumf[row] += sumq;
         }
 
-        yb4 += NSG*NF*NW/4;
+        yb4 += NSG*NBP*NB/4;
     }
 
     for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
@@ -4311,7 +4323,7 @@ void kernel_mul_mv_t_t_short_impl(
         device       char * dst,
         uint3  tgpig,
         ushort tiisg) {
-    const int r0 = tgpig.x*32 + tiisg;
+    const int r0 = tgpig.x*N_SIMDWIDTH + tiisg;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
@@ -8235,7 +8247,7 @@ void kernel_mul_mv_q2_K_f32_impl(
     float yl[32];
     float sumf[nr0]={0.f};
 
-    const short ix = tiisg/8;  // 0...3
+    const short ix = tiisg/8;  // 0...N_SIMDWIDTH/8-1
     const short it = tiisg%8;  // 0...7
     const short iq = it/4;     // 0 or 1
     const short ir = it%4;     // 0...3
@@ -8243,7 +8255,7 @@ void kernel_mul_mv_q2_K_f32_impl(
 
     device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
 
-    for (int ib = ix; ib < nb; ib += 4) {
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
         for (short i = 0; i < 8; ++i) {
             yl[i+ 0] = y4[i+ 0]; sumy[0] += yl[i+ 0];
@@ -8282,7 +8294,7 @@ void kernel_mul_mv_q2_K_f32_impl(
             dh += args.nb01/2;
         }
 
-        y4 += 4 * QK_K;
+        y4 += (N_SIMDWIDTH/8) * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -8342,8 +8354,8 @@ void kernel_mul_mv_q3_K_f32_impl(
     //const uint16_t kmask1 = 0x3030;
     //const uint16_t kmask2 = 0x0f0f;
 
-    const short tid = tiisg/4;
-    const short ix  = tiisg%4;
+    const short tid = tiisg/(N_SIMDWIDTH/8); // intra-block position - the block layout provides 8
+    const short ix  = tiisg%(N_SIMDWIDTH/8); // interleaved blocks per simdgroup pass
     const short ip  = tid/4;          // 0 or 1
     const short il  = 2*((tid%4)/2);  // 0 or 2
     const short ir  = tid%2;
@@ -8384,7 +8396,7 @@ void kernel_mul_mv_q3_K_f32_impl(
     float sumf1[nr0] = {0.f};
     float sumf2[nr0] = {0.f};
 
-    for (int i = ix; i < nb; i += 4) {
+    for (int i = ix; i < nb; i += N_SIMDWIDTH/8) {
         for (short l = 0; l < 8; ++l) {
             yl[l+ 0] = y1[l+ 0];
             yl[l+ 8] = y1[l+16];
@@ -8443,7 +8455,7 @@ void kernel_mul_mv_q3_K_f32_impl(
             dh += args.nb01/2;
         }
 
-        y1 += 4 * QK_K;
+        y1 += (N_SIMDWIDTH/8) * QK_K;
     }
 
     for (int row = 0; row < nr0; ++row) {
@@ -8489,7 +8501,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
 
-    const short ix = tiisg/8;  // 0...3
+    const short ix = tiisg/8;  // 0...N_SIMDWIDTH/8-1
     const short it = tiisg%8;  // 0...7
     const short iq = it/4;     // 0 or 1
     const short ir = it%4;     // 0...3
@@ -8521,7 +8533,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    for (int ib = ix; ib < nb; ib += 4) {
+    for (int ib = ix; ib < nb; ib += N_SIMDWIDTH/8) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
         for (short i = 0; i < 8; ++i) {
@@ -8568,7 +8580,7 @@ void kernel_mul_mv_q4_K_f32_impl(
             dh += args.nb01/2;
         }
 
-        y4 += 4 * QK_K;
+        y4 += (N_SIMDWIDTH/8) * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
@@ -8631,8 +8643,8 @@ void kernel_mul_mv_q5_K_f32_impl(
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
 
-    const short tid = tiisg/4;
-    const short ix  = tiisg%4;
+    const short tid = tiisg/(N_SIMDWIDTH/8); // intra-block position - the block layout provides 8
+    const short ix  = tiisg%(N_SIMDWIDTH/8); // interleaved blocks per simdgroup pass
     const short iq  = tid/4;
     const short ir  = tid%4;
 
@@ -8650,7 +8662,7 @@ void kernel_mul_mv_q5_K_f32_impl(
 
     device const float * y1 = yy + ix*QK_K + y_offset;
 
-    for (int i = ix; i < nb; i += 4) {
+    for (int i = ix; i < nb; i += N_SIMDWIDTH/8) {
         device const uint8_t * q1 = x[i].qs + q_offset;
         device const uint8_t * qh = x[i].qh + l0;
         device const half * dh = &x[i].d;
@@ -8699,7 +8711,7 @@ void kernel_mul_mv_q5_K_f32_impl(
             a  += args.nb01/2;
         }
 
-        y1 += 4 * QK_K;
+        y1 += (N_SIMDWIDTH/8) * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -8763,8 +8775,8 @@ void kernel_mul_mv_q6_K_f32_impl(
 
     float yl[16];
 
-    const short tid = tiisg/2;
-    const short ix  = tiisg%2;
+    const short tid = tiisg/(N_SIMDWIDTH/16); // intra-block position - the block layout provides 16
+    const short ix  = tiisg%(N_SIMDWIDTH/16); // interleaved blocks per simdgroup pass
     const short ip  = tid/8;         // 0 or 1
     const short il  = tid%8;
     const short l0  = 4*il;
@@ -8774,7 +8786,7 @@ void kernel_mul_mv_q6_K_f32_impl(
     const short q_offset_l =  64*ip + l0;
     const short q_offset_h =  32*ip + l0;
 
-    for (int i = ix; i < nb; i += 2) {
+    for (int i = ix; i < nb; i += N_SIMDWIDTH/16) {
         device const uint8_t * q1 = x[i].ql + q_offset_l;
         device const uint8_t * q2 = q1 + 32;
         device const uint8_t * qh = x[i].qh + q_offset_h;
@@ -9639,7 +9651,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
     const int nb   = args.ne00/QK4_NL;
     const int ns01 = args.nb01/args.nb00;
 
-    const short ix = tiisg/2;  // 0...15
+    const short ix = tiisg/2;  // 0...N_SIMDWIDTH/2-1
     const short it = tiisg%2;  // 0 or 1
 
     shmem_f32[tiisg] = kvalues_iq4nl_f[tiisg%16];
@@ -9656,7 +9668,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
     float4 qf1, qf2;
 
     // [TAG_MUL_MV_WEIRD]
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += N_SIMDWIDTH/2) {
         device const float4 * y4 = (device const float4 *)yb;
         yl[0] = y4[0];
         yl[1] = y4[4];
@@ -9690,7 +9702,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
             sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
         }
 
-        yb += 16 * QK4_NL;
+        yb += (N_SIMDWIDTH/2) * QK4_NL;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -9748,7 +9760,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     const int nb   = args.ne00/QK_K;
     const int ns01 = args.nb01/args.nb00;
 
-    const short ix = tiisg/16;  // 0 or 1
+    const short ix = tiisg/16;  // 0..N_SIMDWIDTH/16-1
     const short it = tiisg%16;  // 0...15
     const short ib = it/2;
     const short il = it%2;
@@ -9767,7 +9779,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     float4 qf1, qf2;
 
     // [TAG_MUL_MV_WEIRD]
-    for (int ibl = ix; ibl < nb && ibl < ns01; ibl += 2) {
+    for (int ibl = ix; ibl < nb && ibl < ns01; ibl += N_SIMDWIDTH/16) {
         device const float4 * y4 = (device const float4 *)yb;
         yl[0] = y4[0];
         yl[1] = y4[4];
@@ -9800,7 +9812,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
             sumf[row] += (float)xb.d * ls * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
         }
 
-        yb += 2 * QK_K;
+        yb += (N_SIMDWIDTH/16) * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -9859,7 +9871,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
     const int nb   = args.ne00/QK_MXFP4;
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
-    const short ix = tiisg/2;  // 0...15
+    const short ix = tiisg/2;  // 0...N_SIMDWIDTH/2-1
     const short it = tiisg%2;  // 0 or 1
 
     shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
@@ -9872,7 +9884,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
 
     // note: just the check `ib < nb` is enough, but adding the redundant `&& ib < ns01` check makes the kernel a bit faster
     //       no idea why that is - needs some deeper investigation [TAG_MUL_MV_WEIRD]
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += N_SIMDWIDTH/2) {
         device const float4 * y4 = (device const float4 *) yb;
 
         yl[0] = y4[0];
@@ -9894,7 +9906,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
             sumf[row] += e8m0_to_fp32(xb.e) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
         }
 
-        yb += 16 * QK_MXFP4;
+        yb += (N_SIMDWIDTH/2) * QK_MXFP4;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
