@@ -473,7 +473,8 @@ void write_qwen_cached_step_mask(
     std::vector<ggml_fp16_t> & scratch,
     int64_t mask_steps,
     int64_t visible_prefix_steps,
-    int64_t current_slot) {
+    int64_t current_slot,
+    ggml_backend_t backend) {
     if (tensor == nullptr) {
         throw std::runtime_error("write_qwen_cached_step_mask requires a tensor");
     }
@@ -494,7 +495,11 @@ void write_qwen_cached_step_mask(
         scratch[static_cast<size_t>(i)] = visible;
     }
     scratch[static_cast<size_t>(current_slot)] = visible;
-    ggml_backend_tensor_set(tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    if (backend != nullptr) {
+        ggml_backend_tensor_set_async(backend, tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    }
 }
 
 void write_qwen_batched_cached_step_mask(
@@ -503,7 +508,8 @@ void write_qwen_batched_cached_step_mask(
     int64_t batch_size,
     int64_t mask_steps,
     int64_t visible_prefix_steps,
-    int64_t current_slot) {
+    int64_t current_slot,
+    ggml_backend_t backend) {
     if (tensor == nullptr) {
         throw std::runtime_error("write_qwen_batched_cached_step_mask requires a tensor");
     }
@@ -535,7 +541,11 @@ void write_qwen_batched_cached_step_mask(
         }
         scratch[offset + static_cast<size_t>(current_slot)] = visible;
     }
-    ggml_backend_tensor_set(tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    if (backend != nullptr) {
+        ggml_backend_tensor_set_async(backend, tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    }
 }
 
 }  // namespace engine::modules

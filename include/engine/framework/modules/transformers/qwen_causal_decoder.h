@@ -10,6 +10,7 @@
 #include <optional>
 #include <vector>
 
+#include <ggml-backend.h>
 #include <ggml.h>
 
 namespace engine::modules {
@@ -175,12 +176,17 @@ void write_qwen_causal_prefill_mask(
     int64_t batch_size,
     int64_t steps);
 
+// `backend`, when non-null, uploads the mask with ggml_backend_tensor_set_async instead of the
+// synchronous ggml_backend_tensor_set. The caller must then reach a ggml_backend_synchronize on
+// that backend before it relies on the mask having landed; every caller that passes a backend
+// does so immediately before a graph compute that is followed by exactly such a synchronize.
 void write_qwen_cached_step_mask(
     ggml_tensor * tensor,
     std::vector<ggml_fp16_t> & scratch,
     int64_t mask_steps,
     int64_t visible_prefix_steps,
-    int64_t current_slot);
+    int64_t current_slot,
+    ggml_backend_t backend = nullptr);
 
 void write_qwen_batched_cached_step_mask(
     ggml_tensor * tensor,
@@ -188,6 +194,7 @@ void write_qwen_batched_cached_step_mask(
     int64_t batch_size,
     int64_t mask_steps,
     int64_t visible_prefix_steps,
-    int64_t current_slot);
+    int64_t current_slot,
+    ggml_backend_t backend = nullptr);
 
 }  // namespace engine::modules

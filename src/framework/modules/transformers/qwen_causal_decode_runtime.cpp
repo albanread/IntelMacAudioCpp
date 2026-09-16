@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -173,6 +174,35 @@ std::vector<ggml_fp16_t> prefill_attention_mask_values(
     return out;
 }
 
+// Upload one small per-step graph input.
+//
+// ggml_backend_tensor_set on a discrete GPU is not a memcpy: the destination buffer is private,
+// so the Metal backend builds a blit command buffer, commits it, and blocks on a completion
+// semaphore. Measured on the Radeon Pro Vega II that is 0.159 ms per call regardless of size,
+// and a decode step issues four of them (tokens, positions, mask, cache slot).
+//
+// ggml_backend_tensor_set_async queues the same blit and returns. It is safe here because:
+//   - the Metal backend takes its command queue from the device (ggml_metal_device_get_queue),
+//     the same queue the graph's compute command buffers are created on, so FIFO ordering
+//     guarantees the blit completes before the graph that reads the tensor;
+//   - every decode step calls ggml_backend_synchronize after compute, and that waits on the
+//     last-queued command buffer, which collapses all four uploads into that one wait;
+//   - the Metal implementation copies the host bytes into a fresh MTLBuffer before returning
+//     (newBufferWithBytes), and the generic fallback for backends without set_tensor_async is
+//     synchronize + synchronous set, so the caller's source buffer is never read after return.
+void upload_step_input(
+    ggml_backend_t backend,
+    ggml_tensor * tensor,
+    const void * data,
+    size_t offset,
+    size_t size) {
+    if (backend == nullptr) {
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
+    ggml_backend_tensor_set_async(backend, tensor, data, offset, size);
+}
+
 void write_cached_step_mask(
     const QwenCausalDecodeRuntimeConfig & config,
     ggml_tensor * tensor,
@@ -180,9 +210,10 @@ void write_cached_step_mask(
     int64_t mask_steps,
     int64_t visible_prefix_steps,
     int64_t current_slot,
-    int64_t position) {
+    int64_t position,
+    ggml_backend_t backend = nullptr) {
     if (config.sliding_window <= 0) {
-        write_qwen_cached_step_mask(tensor, scratch, mask_steps, visible_prefix_steps, current_slot);
+        write_qwen_cached_step_mask(tensor, scratch, mask_steps, visible_prefix_steps, current_slot, backend);
         return;
     }
     if (tensor == nullptr) {
@@ -208,7 +239,7 @@ void write_cached_step_mask(
         scratch[static_cast<size_t>(i)] = visible;
     }
     scratch[static_cast<size_t>(current_slot)] = visible;
-    ggml_backend_tensor_set(tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    upload_step_input(backend, tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
 }
 
 void write_batched_cached_step_mask(
@@ -219,9 +250,11 @@ void write_batched_cached_step_mask(
     int64_t mask_steps,
     int64_t visible_prefix_steps,
     int64_t current_slot,
-    int64_t position) {
+    int64_t position,
+    ggml_backend_t backend = nullptr) {
     if (config.sliding_window <= 0) {
-        write_qwen_batched_cached_step_mask(tensor, scratch, batch_size, mask_steps, visible_prefix_steps, current_slot);
+        write_qwen_batched_cached_step_mask(
+            tensor, scratch, batch_size, mask_steps, visible_prefix_steps, current_slot, backend);
         return;
     }
     if (tensor == nullptr) {
@@ -258,7 +291,7 @@ void write_batched_cached_step_mask(
         }
         scratch[offset + static_cast<size_t>(current_slot)] = visible;
     }
-    ggml_backend_tensor_set(tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    upload_step_input(backend, tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
 }
 
 void write_batched_cached_step_mask_variable(
@@ -269,7 +302,8 @@ void write_batched_cached_step_mask_variable(
     int64_t mask_steps,
     const std::vector<int64_t> & visible_prefix_steps,
     const std::vector<int32_t> & current_slots,
-    const std::vector<int64_t> & positions) {
+    const std::vector<int64_t> & positions,
+    ggml_backend_t backend = nullptr) {
     if (tensor == nullptr) {
         throw std::runtime_error("QwenCausalDecodeRuntime variable batched cached mask requires a tensor");
     }
@@ -304,7 +338,7 @@ void write_batched_cached_step_mask_variable(
         }
         scratch[row_offset + static_cast<size_t>(current_slot)] = visible;
     }
-    ggml_backend_tensor_set(tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
+    upload_step_input(backend, tensor, scratch.data(), 0, scratch.size() * sizeof(ggml_fp16_t));
 }
 
 core::TensorValue compact_logits_readback(
@@ -684,7 +718,8 @@ public:
         if (decode_input_kind_ != InputKind::Token) {
             throw std::runtime_error("QwenCausalDecodeRuntime decode graph expects embeddings");
         }
-        ggml_backend_tensor_set(decode_input_, &token, 0, sizeof(int32_t));
+        // `token` is a by-value parameter and outlives run_decode_step()'s ggml_backend_synchronize
+        upload_step_input(backend_, decode_input_, &token, 0, sizeof(int32_t));
         return run_decode_step();
     }
 
@@ -693,7 +728,7 @@ public:
         if (decode_input_kind_ != InputKind::Token) {
             throw std::runtime_error("QwenCausalDecodeRuntime decode graph expects embeddings");
         }
-        ggml_backend_tensor_set(decode_input_, &token, 0, sizeof(int32_t));
+        upload_step_input(backend_, decode_input_, &token, 0, sizeof(int32_t));
         run_decode_step_into(out);
     }
 
@@ -705,7 +740,7 @@ public:
         if (embedding.size() != static_cast<size_t>(config_.decoder.stack.hidden_size)) {
             throw std::runtime_error("QwenCausalDecodeRuntime decode embedding size mismatch");
         }
-        ggml_backend_tensor_set(decode_input_, embedding.data(), 0, embedding.size() * sizeof(float));
+        upload_step_input(backend_, decode_input_, embedding.data(), 0, embedding.size() * sizeof(float));
         return run_decode_step();
     }
 
@@ -745,7 +780,8 @@ public:
         if (tokens.size() != static_cast<size_t>(batched_decode_batch_size_)) {
             throw std::runtime_error("QwenCausalDecodeRuntime batched decode token size mismatch");
         }
-        ggml_backend_tensor_set(batched_decode_input_, tokens.data(), 0, tokens.size() * sizeof(int32_t));
+        // caller-owned vector, alive across run_batched_decode_step()'s ggml_backend_synchronize
+        upload_step_input(backend_, batched_decode_input_, tokens.data(), 0, tokens.size() * sizeof(int32_t));
         return run_batched_decode_step();
     }
 
@@ -762,7 +798,8 @@ public:
         if (embeddings.size() != static_cast<size_t>(batch_size * config_.decoder.stack.hidden_size)) {
             throw std::runtime_error("QwenCausalDecodeRuntime batched decode embedding size mismatch");
         }
-        ggml_backend_tensor_set(batched_decode_input_, embeddings.data(), 0, embeddings.size() * sizeof(float));
+        upload_step_input(
+            backend_, batched_decode_input_, embeddings.data(), 0, embeddings.size() * sizeof(float));
         return run_batched_decode_step();
     }
 
@@ -1539,10 +1576,14 @@ private:
         if (decode_cache_.valid_steps() >= decode_cache_steps_) {
             throw std::runtime_error("QwenCausalDecodeRuntime decode cache exhausted");
         }
-        const int32_t position = static_cast<int32_t>(decode_cache_.current_end());
-        ggml_backend_tensor_set(decode_positions_, &position, 0, sizeof(int32_t));
-        const int32_t cache_slot = static_cast<int32_t>(decode_cache_.valid_steps());
-        ggml_backend_tensor_set(decode_cache_slot_, &cache_slot, 0, sizeof(int32_t));
+        // the upload sources are members rather than locals so that they outlive the async blit
+        // even if a backend is ever added whose set_tensor_async does not copy the host bytes
+        decode_position_value_ = static_cast<int32_t>(decode_cache_.current_end());
+        const int32_t position = decode_position_value_;
+        upload_step_input(backend_, decode_positions_, &decode_position_value_, 0, sizeof(int32_t));
+        decode_cache_slot_value_ = static_cast<int32_t>(decode_cache_.valid_steps());
+        const int32_t cache_slot = decode_cache_slot_value_;
+        upload_step_input(backend_, decode_cache_slot_, &decode_cache_slot_value_, 0, sizeof(int32_t));
         write_cached_step_mask(
             config_,
             decode_attention_mask_,
@@ -1550,7 +1591,8 @@ private:
             decode_cache_steps_,
             decode_cache_.valid_steps(),
             cache_slot,
-            position);
+            position,
+            backend_);
         core::set_backend_threads(backend_, threads_);
         const ggml_status status = core::compute_backend_graph(backend_, decode_graph_);
         ggml_backend_synchronize(backend_);
@@ -1575,16 +1617,19 @@ private:
         if (decode_cache_.valid_steps() >= decode_cache_steps_) {
             throw std::runtime_error("QwenCausalDecodeRuntime decode cache exhausted");
         }
-        const int32_t position = static_cast<int32_t>(decode_cache_.current_end());
-        ggml_backend_tensor_set(decode_positions_, &position, 0, sizeof(int32_t));
-        const int32_t cache_slot = static_cast<int32_t>(decode_cache_.valid_steps());
-        ggml_backend_tensor_set(decode_cache_slot_, &cache_slot, 0, sizeof(int32_t));
+        decode_position_value_ = static_cast<int32_t>(decode_cache_.current_end());
+        const int32_t position = decode_position_value_;
+        upload_step_input(backend_, decode_positions_, &decode_position_value_, 0, sizeof(int32_t));
+        decode_cache_slot_value_ = static_cast<int32_t>(decode_cache_.valid_steps());
+        const int32_t cache_slot = decode_cache_slot_value_;
+        upload_step_input(backend_, decode_cache_slot_, &decode_cache_slot_value_, 0, sizeof(int32_t));
         if (config_.sliding_window <= 0) {
-            const auto visible = ggml_fp32_to_fp16(0.0F);
-            decode_attention_mask_values_[static_cast<size_t>(cache_slot)] = visible;
-            ggml_backend_tensor_set(
+            // upload from the member scratch, not from a stack temporary
+            decode_attention_mask_values_[static_cast<size_t>(cache_slot)] = ggml_fp32_to_fp16(0.0F);
+            upload_step_input(
+                backend_,
                 decode_attention_mask_,
-                &visible,
+                decode_attention_mask_values_.data() + static_cast<std::ptrdiff_t>(cache_slot),
                 static_cast<size_t>(cache_slot) * sizeof(ggml_fp16_t),
                 sizeof(ggml_fp16_t));
         } else {
@@ -1595,7 +1640,8 @@ private:
                 decode_cache_steps_,
                 decode_cache_.valid_steps(),
                 cache_slot,
-                position);
+                position,
+                backend_);
         }
         core::set_backend_threads(backend_, threads_);
         const ggml_status status = core::compute_backend_graph(backend_, decode_graph_);
@@ -1623,7 +1669,9 @@ private:
         if (batched_decode_cache_.valid_steps() >= batched_decode_cache_steps_) {
             throw std::runtime_error("QwenCausalDecodeRuntime batched decode cache exhausted");
         }
-        int32_t position = static_cast<int32_t>(batched_decode_cache_.current_end());
+        // member, not a local: the async upload below must not read a dead stack slot
+        batched_decode_position_value_ = static_cast<int32_t>(batched_decode_cache_.current_end());
+        const int32_t position = batched_decode_position_value_;
         const int32_t cache_slot = static_cast<int32_t>(batched_decode_cache_.valid_steps());
         if (batched_decode_variable_positions_) {
             const auto & current_ends = batched_decode_cache_.current_end_by_batch();
@@ -1640,7 +1688,8 @@ private:
                 batched_decode_cache_slots_[static_cast<size_t>(batch)] =
                     static_cast<int32_t>(batch * batched_decode_cache_steps_ + row_valid_steps);
             }
-            ggml_backend_tensor_set(
+            upload_step_input(
+                backend_,
                 batched_decode_positions_,
                 batched_decode_positions_values_.data(),
                 0,
@@ -1653,9 +1702,11 @@ private:
                 batched_decode_cache_steps_,
                 valid_steps,
                 batched_decode_cache_slots_,
-                current_ends);
+                current_ends,
+                backend_);
         } else {
-            ggml_backend_tensor_set(batched_decode_positions_, &position, 0, sizeof(int32_t));
+            upload_step_input(
+                backend_, batched_decode_positions_, &batched_decode_position_value_, 0, sizeof(int32_t));
             for (int64_t batch = 0; batch < batched_decode_batch_size_; ++batch) {
                 batched_decode_cache_slots_[static_cast<size_t>(batch)] =
                     static_cast<int32_t>(batch * batched_decode_cache_steps_ + cache_slot);
@@ -1668,9 +1719,11 @@ private:
                 batched_decode_cache_steps_,
                 batched_decode_cache_.valid_steps(),
                 cache_slot,
-                position);
+                position,
+                backend_);
         }
-        ggml_backend_tensor_set(
+        upload_step_input(
+            backend_,
             batched_decode_cache_slot_,
             batched_decode_cache_slots_.data(),
             0,
@@ -1842,6 +1895,8 @@ private:
         decode_graph_ = nullptr;
         decode_cache_ = runtime::TransformerKVCache();
         decode_attention_mask_values_.clear();
+        decode_position_value_ = 0;
+        decode_cache_slot_value_ = 0;
         decode_cache_steps_ = 0;
         decode_input_kind_ = InputKind::None;
     }
@@ -1868,6 +1923,7 @@ private:
         batched_decode_attention_mask_values_.clear();
         batched_decode_cache_slots_.clear();
         batched_decode_positions_values_.clear();
+        batched_decode_position_value_ = 0;
         batched_decode_batch_size_ = 0;
         batched_decode_cache_steps_ = 0;
         batched_decode_input_kind_ = InputKind::None;
@@ -1931,6 +1987,10 @@ private:
     std::unique_ptr<ggml_context, GgmlContextDeleter> decode_ctx_;
     ggml_tensor * decode_input_ = nullptr;
     ggml_tensor * decode_positions_ = nullptr;
+    // upload staging for the per-step scalars: these are the source buffers of asynchronous
+    // blits, so they must outlive the call that queues them (see upload_step_input)
+    int32_t decode_position_value_ = 0;
+    int32_t decode_cache_slot_value_ = 0;
     ggml_tensor * decode_cache_slot_ = nullptr;
     ggml_tensor * decode_attention_mask_ = nullptr;
     ggml_tensor * decode_logits_readback_token_ids_ = nullptr;
@@ -1956,6 +2016,7 @@ private:
     std::vector<ggml_fp16_t> batched_decode_attention_mask_values_;
     std::vector<int32_t> batched_decode_cache_slots_;
     std::vector<int32_t> batched_decode_positions_values_;
+    int32_t batched_decode_position_value_ = 0;
     runtime::TransformerBatchedKVCache batched_decode_cache_;
     int64_t batched_decode_batch_size_ = 0;
     int64_t batched_decode_cache_steps_ = 0;
