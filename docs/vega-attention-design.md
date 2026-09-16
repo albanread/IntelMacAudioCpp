@@ -4,6 +4,61 @@
 workload and Apple's assumptions against the user's oracles and the engine source. What they changed
 is listed first, because some of it reverses the original.*
 
+## Outcome — the bench decided it, 16 Sep 2026, 20:11
+
+`attention_bench.mojo` (plain Mojo: `std.gpu`, `max.gpu.host`, `max.gpu.sync`, no ObjC, no Metal API;
+784 lines; `/Volumes/S/oracles` branch `attention-bench`, commits `2de3831` + `ff4291c`; results in
+`RESULTS-vega2-attention.md`) implemented both Phase A variants on the native `[128, 8, S, B]` layout
+with BLOCK, dtype, batch and `valid_steps` as parameters, verified every timed row against a Float64
+CPU reference (maxerr ≤ 2.7e-8, NMSE ≤ 4e-14, zero wrong in 124+ rows including ragged `valid`,
+partial blocks, B=2, fp16 and scan > valid), and measured. Every run under `timeout 30`.
+
+**Phase A(b) — lane ↔ dim, two keys per wave — wins.** 24 of 25 cells; best-vs-best at S = 8,192
+**105.8 µs vs 192.8 µs per layer = 1.82×** (2.0–2.2× at the same BLOCK). At S = 8,192 it reads K+V
+at **634 GB/s** — ~91% of the 699 GB/s the same kernel reaches at B = 2, 76% of the 830 GB/s blit
+ceiling. KEY tops out at 348 GB/s and gets worse with larger blocks: exactly the L1 failure the
+design predicted for it.
+
+**Per token (×28 layers), fp32, B = 1: 0.56 / 0.80 / 1.08 / 1.73 / 2.96 ms at S = 256 … 8,192.**
+Against the engine's ~62–66 ms/token context-dependent cost at S ≈ 8,000, the attention itself is
+**~3 ms — under 5% of it**. The context cost the engine pays is the reshape chain and the
+serial-scan lowering around the arithmetic, not the arithmetic or the bytes.
+
+**Three things the bench found that the design did not contain:**
+
+1. **Grid order was the larger effect.** Launching key-block-fastest put the 8 KV heads of one
+   token range `nblocks` apart, so resident threadgroups each took a 512 B slice out of every 4 KiB
+   token row. KV-head-fastest makes the resident set consume whole rows: **3.9× at BLOCK 64,
+   S = 8,192** (502.6 → 128.0 µs). The unit of DRAM locality in the native layout is the token row
+   across all 8 heads. The design's "1 KiB contiguous per wave instruction" was really two 512 B
+   chunks 4 KiB apart; what matters is keeping the 8 heads of a token range co-resident.
+2. **The matmul occupancy ladder does not transfer.** At S = 8,192 the curve from 16 TG/CU down
+   to 1 is flat-to-inverted (129.6 → 109.8 µs) and B = 2 — twice the threadgroups, same per-TG
+   work — buys only 10–18%. With 4 float4 loads in flight per lane the memory pipe saturates by ILP
+   at ~2 TG/CU. R2's "≥ 256 threadgroups, ideally 1,024" does not govern this kernel above
+   S ≈ 4,000. BLOCK 64 for S ≤ 1,024; above that 128–512 are within 3% and BLOCK 256 is a fair
+   single choice.
+3. **The launch form.** `ctx.enqueue_function[kernel](...)` re-resolves the function per call at
+   34–145 µs per dispatch; `compile_function` once plus `enqueue_function(handle, ...)` is 3–6 µs.
+   The control copy kernel moved from 573–591 to 634–660 GB/s from that change alone. This bears
+   directly on the engine's 8.7 µs × 1,013 dispatch floor.
+
+Also measured: **fp16 K/V** is 1.37× faster for half the bytes (435 GB/s) — issue-bound, not
+bandwidth-bound, so fp16 buys less than 2× here; **B = 2** reaches 696–699 GB/s, above the 647
+triad, so B = 1 is parallelism-limited at 128 threadgroups rather than bandwidth-limited;
+**over-scan** costs its full length (scanning 8,192 for 4,096 valid: 1.7×), confirming R5a;
+`exp2` lowers and is correct on this card (first run ever, worst rel 5.3e-6).
+
+**Projection, honestly bounded.** Semantic stage 5,396 tokens at 11.24 + ~2.1 ms ≈ 100 s (from
+431.8); ABC ≈ 31 s (from 110.2); NAR 240 s and VAE 32.6 s untouched (prefill-shaped, kept on the
+explicit path). **Full song ≈ 404 s, RTF ≈ 1.87** from 3.77. The floor after this is the
+11.24 ms/token of dispatch and weights — the next problem, and the launch-form finding is the
+first lead on it.
+
+**Before the engine uses this kernel** (from review): masked keys currently load a clamped row and
+`0 × NaN` would poison the output if the over-allocation holds NaN bits — clamp to `valid − 1` or
+select V to 0 when masked. `valid == 0` and `scan < valid` are caller contracts.
+
 ## Corrections applied after verification
 
 1. **The KV cache is F32 on Metal, not F16.** 512-byte rows, 224 KiB per token, 8 KiB per layer per
@@ -159,7 +214,7 @@ measured occupancy ladder on this card for 256-thread threadgroups is 1 TG/CU �
 At S = 8,000 and 8 KV heads: BLOCK 256 gives 256 threadgroups; BLOCK 64 gives 1,000. The bench
 measures which pays.
 
-### 3.2 Three phases — and Phase A's mapping is decided by measurement
+### 3.2 Three phases — Phase A's mapping was decided by measurement: lane ↔ dim (see Outcome)
 
 Apple's kernel uses one lane→data mapping throughout because `simdgroup_matrix` imposes it. We have no
 such constraint. Two candidate mappings for the score phase, both implemented as comptime parameters

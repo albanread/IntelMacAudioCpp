@@ -97,6 +97,33 @@ a{color:var(--blue)}
 </header>
 
 <section>
+<h2>Outcome — the bench decided it</h2>
+<div class="prose">
+<p><code>attention_bench.mojo</code> — plain Mojo, <code>std.gpu</code> + <code>max.gpu.host</code>, no ObjC, no Metal API — implemented both Phase A variants on the native <code>[128, 8, S, B]</code> layout with block size, dtype, batch and <code>valid_steps</code> as parameters, checked every timed row against a Float64 CPU reference (maxerr ≤ 2.7e-8, zero wrong in 124+ rows including ragged <code>valid</code>, partial blocks, B=2, fp16), and measured. <code>/Volumes/S/oracles</code>, branch <code>attention-bench</code>.</p>
+</div>
+<div class="tbl">
+<table>
+<thead><tr><th>µs per layer, fp32, B=1, best BLOCK</th><th>S=256</th><th>S=1024</th><th>S=2048</th><th>S=4096</th><th>S=8192</th></tr></thead>
+<tbody>
+<tr><td><b>lane ↔ dim (b)</b></td><td class="n"><b>19.9</b></td><td class="n"><b>28.4</b></td><td class="n"><b>38.6</b></td><td class="n"><b>61.9</b></td><td class="n"><b>105.8</b></td></tr>
+<tr><td>lane ↔ key (a)</td><td class="n">24.8</td><td class="n">41.9</td><td class="n">64.4</td><td class="n">108.4</td><td class="n">192.8</td></tr>
+<tr><td>per token, ×28, variant (b)</td><td class="n">0.56 ms</td><td class="n">0.80</td><td class="n">1.08</td><td class="n">1.73</td><td class="n"><b>2.96 ms</b></td></tr>
+</tbody>
+</table>
+</div>
+<dl class="req">
+  <dt>decided</dt><dd><b>Lane ↔ dim, two keys per wave.</b> 24 of 25 cells; 1.82× best-vs-best at S=8,192. It reads K+V at <b>634 GB/s</b> — ~91% of the 699 the same kernel reaches at B=2, 76% of blit. Lane ↔ key tops out at 348 GB/s and gets worse with bigger blocks: the L1 failure the design predicted for it.</dd>
+  <dt>the prize</dt><dd>Attention at S=8,192 is <b>~3 ms per token — under 5%</b> of the engine's ~62–66 ms context-dependent cost. What the engine pays for is the reshape chain and the serial-scan lowering around the arithmetic, not the arithmetic or the bytes.</dd>
+  <dt>not in the design</dt><dd><b>Grid order was the larger effect: 3.9×.</b> Key-block-fastest put the 8 KV heads of a token range far apart in launch order, so resident threadgroups each took a 512 B slice from every 4 KiB token row. KV-head-fastest keeps whole rows resident. The unit of DRAM locality is the token row across all 8 heads.</dd>
+  <dt>not in the design</dt><dd><b>The matmul occupancy ladder does not transfer.</b> From 16 TG/CU down to 1 the curve is flat-to-inverted; B=2 buys only 10–18%. With four float4 loads in flight per lane the memory pipe saturates by ILP at ~2 TG/CU. Above S≈4,000, BLOCK 128–512 are within 3%; 256 is a fair single choice; 64 for S ≤ 1,024.</dd>
+  <dt>not in the design</dt><dd><b>The launch form.</b> <code>enqueue_function[kernel]</code> re-resolves per call at 34–145 µs per dispatch; <code>compile_function</code> once plus a handle is 3–6 µs. The control copy kernel gained ~10% from that alone. This bears directly on the engine's 1,013 × 8.7 µs dispatch floor.</dd>
+  <dt>also</dt><dd>fp16 K/V: 1.37× for half the bytes — issue-bound, so fp16 buys less than 2× here. B=2 reaches 699 GB/s, so B=1 is parallelism-limited, not bandwidth-limited. Over-scan costs its full length (1.7×), confirming R5a. <code>exp2</code> lowers correctly on this card — first run ever.</dd>
+  <dt>projection</dt><dd>Semantic ≈ 100 s (from 432), ABC ≈ 31 s (from 110), NAR and VAE untouched. <b>Full song ≈ 404 s, RTF ≈ 1.87</b> from 3.77. The floor after this is 11.24 ms/token of dispatch and weights.</dd>
+  <dt>before integration</dt><dd>Masked keys load a clamped row; <code>0 × NaN</code> would poison the output if the over-allocation holds NaN bits. Clamp to <code>valid − 1</code> or select V to 0 when masked.</dd>
+</dl>
+</section>
+
+<section>
 <h2>Corrections applied after verification</h2>
 <div class="prose">
 <p>Three agents checked the machine, the workload and Apple's assumptions against the user's oracles and the engine source after this page was first published. Some of what they found reverses the original, so it comes first.</p>
@@ -257,7 +284,7 @@ a{color:var(--blue)}
 </section>
 
 <section>
-<h2>Phase A — scores · two candidate mappings, decided by the bench</h2>
+<h2>Phase A — scores · decided: lane ↔ dim, two keys per wave</h2>
 <div class="prose">
 <p>The score for key <i>j</i> is a 128-long dot product with Q. Two mappings, both comptime variants of <code>attention_bench.mojo</code>. <b>(a) lane ↔ key</b>, drawn below: every lane forms its own dot product, Q is a broadcast, zero cross-lane ops — but 64 rows 4,096 B apart per instruction, resting on L1. <b>(b) lane ↔ dim, two keys per wave:</b> 32 lanes × float4 cover one 512 B row, so a 64-lane wave reads two keys per instruction, 1 KiB contiguous, then a 5-step shuffle reduction over 32 lanes per key pair, with ≤ 8 accumulator chains per lane (the measured ILP knee). (b) is the structurally coalesced one and wave64 <i>halves</i> its softmax and barrier count per key relative to Apple's 32-wide blocks. The register file cannot be read on this toolchain, so this is decided by throughput, as the fork's own <code>nr0</code> sweep was.</p>
 </div>
@@ -582,7 +609,7 @@ a{color:var(--blue)}
 <dl class="req">
   <dt>gate 1</dt><dd><b>Op-level.</b> <code>test-backend-ops -o FLASH_ATTN_EXT</code> at the real shapes (head_dim 128, n_q 1–2, ctx 64…8,192), one op under the 30 s watchdog, against the CPU reference. NMSE below the op's tolerance — a number, not an impression.</dd>
   <dt>gate 2</dt><dd><b>Per-tensor A/B on the card.</b> New kernel against the explicit path on identical inputs, via <code>GGML_METAL_FA_W64_DISABLE</code>. Max abs and NMSE per layer. This catches what the synthetic shapes miss.</dd>
-  <dt>gate 3</dt><dd><b>The curve.</b> ms/token at 200 / 800 / 1,600 / 3,200 / 6,400, two repeats. It must go flat — the dashed red line in the first figure. Phase A's variant is chosen here, and a flat curve that sits far above the intercept means the fixed floor — dispatch — is next.</dd>
+  <dt>gate 3</dt><dd><b>The curve — passed in the bench, pending in the engine.</b> ms/token at 200 / 800 / 1,600 / 3,200 / 6,400, two repeats. It must go flat — the dashed red line in the first figure. Phase A's variant is chosen here, and a flat curve that sits far above the intercept means the fixed floor — dispatch — is next.</dd>
   <dt>gate 4</dt><dd><b>The oracle.</b> Waveform check — peak, full-scale count, level count — then the full song, then the headphones. In that order, as always. No timing number is quoted before gate 4 passes.</dd>
 </dl>
 </div>

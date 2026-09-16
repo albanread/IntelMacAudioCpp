@@ -118,6 +118,18 @@ after verification: the KV cache is **F32** on Metal (224 KiB/token, not 112), t
 dominant cost is the `REPEAT`/`CONT` reshape chain (56% of step time), the runtime over-scans the
 allocated cache, and the fixed floor that remains is 1,013 dispatches per token at 8.7 µs each.
 
+**Measured, 16 Sep 2026, 20:11.** A standalone plain-Mojo benchmark of the design
+(`attention_bench.mojo`, `/Volumes/S/oracles` branch `attention-bench`; results in
+`RESULTS-vega2-attention.md`) decided the open question: **lane-per-dim with two keys per wave**
+wins 24 of 25 cells, 1.82× best-vs-best at S = 8,192, reading K+V at 634 GB/s (76% of the blit
+ceiling), verified against a Float64 CPU reference on every row. Attention at S = 8,192 costs
+**~3 ms per token** — under 5% of the engine's context-dependent cost — so the engine's remaining
+cost is the reshape/serial-scan lowering, not the arithmetic. Two findings the design lacked:
+KV-head-fastest grid order is worth up to 3.9× (the unit of DRAM locality is the 4 KiB token row
+across all 8 heads), and the template `enqueue_function` launch form costs 34–145 µs per dispatch
+against 3–6 µs for a precompiled handle. Projected full song ≈ 404 s, RTF ≈ 1.87, with NAR and VAE
+untouched. The kernel is not yet integrated into this tree.
+
 The output is real audio at full length — peak 0.947, 0% clipped, 71,182 distinct levels, DC
 3.5e-5 — so this is an honest speed number, not a fast wrong answer.
 
