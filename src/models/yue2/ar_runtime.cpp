@@ -161,6 +161,10 @@ engine::modules::QwenCausalDecodeRuntimeConfig make_runtime_config(
     out.decoder.stack.runtime.static_cache.update_mode = engine::modules::QwenDecoderStaticCacheUpdateMode::DirectSetRows;
     out.decoder.stack.runtime.static_cache.set_rows_mode =
         engine::modules::QwenDecoderStaticCacheSetRowsMode::BackendViewOptimized;
+    // SiLU(gate) followed by MUL(., up) is two dispatches per layer. ggml_swiglu_split folds them
+    // into one GLU kernel that computes the same expression, x0 / (1 + exp(-x0)) * x1, in a single
+    // pass. 28 layers, so 28 fewer dispatches per token on every AR graph built from this config.
+    out.decoder.stack.runtime.mlp.mode = engine::modules::QwenDecoderMLPMode::FusedSwiGLU;
     if (backend_type == core::BackendType::Cuda || backend_type == core::BackendType::Hip ||
         backend_type == core::BackendType::Vulkan) {
         out.decoder.static_cache_type = GGML_TYPE_F16;
