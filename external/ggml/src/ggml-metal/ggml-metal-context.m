@@ -136,6 +136,13 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
+    // concurrent dispatch relies on memoryBarrierWithScope: ordering accesses between kernels.
+    // AMD (and other non-Apple) GPUs on macOS do not enforce this, which silently corrupts results,
+    // so restrict concurrent dispatch to Apple GPUs unless explicitly overridden
+    if (!props_dev->supports_gpu_family_apple7 && getenv("GGML_METAL_CONCURRENCY_ENABLE") == nil) {
+        res->use_concurrency = false;
+    }
+
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
         res->debug_graph = val ? atoi(val) : 0;
