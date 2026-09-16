@@ -71,12 +71,44 @@ is where the M4 Max's `simdgroup_matrix` instructions have no Vega equivalent. O
 GEMM reaches 1.82 TFLOP/s against the 2.67 TFLOP/s a hand-written Mojo kernel reaches on this card,
 so roughly 1.5× of that 4.2× is still recoverable; the rest is silicon.
 
+### A full song, measured — 16 September 2026
+
 > [!WARNING]
-> **These figures are for a short clip.** On a full 3:37 song the autoregressive stages dominate and
-> are far worse — ABC generation runs at ~20 tok/s against the M4 Max's 96 tok/s. Flash attention is
-> gated on `simdgroup_matrix` and has no wave64 kernel in either tree, so attention takes the
-> explicit path, and that cost grows with context in a way a 200-token clip never exposes. A wave64
-> `FLASH_ATTN_EXT` matters more for real songs than any further GEMM tuning.
+> **The short-clip figures above flatter this card.** On a real song it is **4.45x slower than the
+> M4 Max**, not 1.72x. Here is the measurement.
+
+`tonight-awake`, the audio.cpp benchmark song, q8_0 weights, f32 VAE, 8 NAR steps, `cot=full`:
+
+| | Mac Pro 2019 / Vega II | Mac Studio / M4 Max |
+|---|---|---|
+| **song length** | **3:35.8** (215.8 s) | 3:36.8 |
+| **compute time** | **13 min 34.7 s** (814.7 s) | **3 min 2.7 s** (182.7 s) |
+| **RTF** | **3.77** | **0.84** |
+| measured | 16 Sep 2026 | 15 Sep 2026 |
+
+Stage breakdown, and this is the whole story:
+
+| stage | Vega II | M4 Max | ratio |
+|---|---|---|---|
+| **semantic (AR)** | **542.1 s — 67% of wall** | ~95 s | **~5.7x** |
+| &nbsp;&nbsp;of which ABC score | 110.2 s / 2,240 tok = **20.3 tok/s** | 96.4 tok/s | 4.7x |
+| &nbsp;&nbsp;of which semantic tokens | 431.8 s / 5,396 tok = **12.5 tok/s** | 75.3 tok/s | 6.0x |
+| NAR solve | 240.0 s | 63.4 s | 3.8x |
+| VAE decode | 32.6 s | 22.4 s | 1.5x |
+
+**Two thirds of a full song is spent in autoregressive decode, and that is the stage this work does
+not help.** The GEMM fixed the NAR stage; attention is untouched. `FLASH_ATTN_EXT` is gated on
+`simdgroup_matrix` support and aborts rather than falling back, so AMD must run with
+`AUDIOCPP_DISABLE_FLASH_ATTN=1` and take the explicit attention path — whose cost grows with
+context. At a 24,576-token context that is ruinous, and a 200-token clip never shows it. It also
+explains why NAR came in at 240 s when the clip's 4.98 s / 200 frames would have predicted 134 s:
+NAR attends over the same growing context.
+
+**So the next piece of work on this card is a wave64 `FLASH_ATTN_EXT`, not more GEMM tuning.** No
+such kernel exists in this tree or in llama.cpp's. Four flash-attention kernels would need porting.
+
+The output is real audio at full length — peak 0.947, 0% clipped, 71,182 distinct levels, DC
+3.5e-5 — so this is an honest speed number, not a fast wrong answer.
 
 ## What changed
 
