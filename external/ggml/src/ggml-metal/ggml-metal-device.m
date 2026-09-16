@@ -8,6 +8,9 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <errno.h>
+#include <string.h>  // strcmp
+#include <strings.h> // strcasecmp
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -490,6 +493,37 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
             return res;
         }
 
+        // the whole library is compiled with a single N_SIMDWIDTH, taken from a one-off probe of a
+        // trivial kernel. Metal is free to pick the execution width per pipeline (on RDNA parts it
+        // picks wave32 or wave64 depending on register pressure), so a real kernel can disagree
+        // with the probe - and every lane -> data mapping in that kernel would then be wrong.
+        // refuse loudly rather than compute silent garbage.
+        //
+        // note: this guard aborts where its sibling immediately above returns a null pipeline.
+        //       they differ deliberately. the sibling is upstream's own sanity check on a
+        //       degenerate PSO and is left exactly as upstream wrote it, so Apple-silicon
+        //       behaviour is untouched. this one is the invariant the whole wave64 port rests
+        //       on: there is no configuration to continue into, because every kernel in the
+        //       library has already been compiled for a lane count the hardware is not using.
+        //
+        //       it therefore aborts *before* releasing obj or unlocking. cleaning up first would
+        //       write a fatal path as if it were recoverable - and if GGML_ASSERT were ever
+        //       compiled out, the code below would publish a released pipeline object and the
+        //       function tail would unlock a lock it no longer holds.
+        {
+            const int tew = (int) obj.threadExecutionWidth;
+            const int nsw = ggml_metal_device_get_props(lib->dev)->simd_width;
+
+            if (tew != nsw) {
+                GGML_LOG_ERROR("%s: pipeline '%s' (base = '%s') has threadExecutionWidth = %d, but the library was compiled with N_SIMDWIDTH = %d\n",
+                        __func__, name, base, tew, nsw);
+                GGML_LOG_ERROR("%s: the lane -> data mapping in this kernel is wrong at %d lanes - refusing the pipeline\n",
+                        __func__, tew);
+
+                GGML_ASSERT(tew == nsw && "Metal pipeline threadExecutionWidth does not match the compiled N_SIMDWIDTH");
+            }
+        }
+
         res.pipeline = ggml_metal_pipeline_init();
         res.pipeline->obj = obj;
 
@@ -579,6 +613,12 @@ struct ggml_metal_device {
     ggml_metal_library_t library;
 
     struct ggml_metal_device_props props;
+
+    // the SIMD group width as the hardware probe reported it, raw: 0 means the probe failed or
+    // returned a width this backend does not support, in which case props.simd_width holds the
+    // 32-lane fallback instead. capability decisions that must reflect the real hardware
+    // (has_mm_w64) key off this field, so the fallback can never arm a wave64-only path.
+    int simd_width_probed;
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
@@ -677,6 +717,42 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
     free(rsets);
 }
 
+// read an integer environment dial.
+//
+// returns false and leaves *out untouched when the variable is unset or not a valid integer, so a
+// typo can never silently select a degenerate configuration. values outside [lo, hi] are clamped.
+// whatever ends up being applied is logged.
+static bool ggml_metal_getenv_int(const char * name, int lo, int hi, int * out) {
+    const char * val = getenv(name);
+
+    if (val == NULL) {
+        return false;
+    }
+
+    char * end = NULL;
+
+    errno = 0;
+    const long v = strtol(val, &end, 10);
+
+    if (end == val || *end != '\0' || errno == ERANGE) {
+        GGML_LOG_WARN("%s: ignoring %s='%s' - not a valid integer, keeping the default\n", __func__, name, val);
+        return false;
+    }
+
+    long res = v;
+
+    if (res < lo || res > hi) {
+        res = res < lo ? lo : hi;
+        GGML_LOG_WARN("%s: %s=%ld is outside the supported range [%d, %d] - clamping to %ld\n", __func__, name, v, lo, hi, res);
+    }
+
+    GGML_LOG_INFO("%s: %s = %ld\n", __func__, name, res);
+
+    *out = (int) res;
+
+    return true;
+}
+
 ggml_metal_device_t ggml_metal_device_init(int device) {
     ggml_metal_device_t dev = calloc(1, sizeof(struct ggml_metal_device));
 
@@ -742,20 +818,34 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             // determine the SIMD group width by compiling a trivial kernel and asking the PSO.
             // Apple GPUs report 32, AMD GCN parts report 64 - the shader library is then compiled
             // with a matching N_SIMDWIDTH so the lane -> data mapping in every kernel is correct.
-            // GGML_METAL_SIMD_WIDTH overrides the probe, for A/B against the old hardcoded 32.
-            dev->props.simd_width = 32;
+            //
+            // the width is deliberately not overridable: ggml_metal_library_compile_pipeline()
+            // asserts every pipeline's threadExecutionWidth against it, so a width that agreed
+            // with the probe would change nothing and one that disagreed would abort at the first
+            // pipeline. the supported A/B dial for the GEMM is GGML_METAL_MM_W64_DISABLE=1, which
+            // leaves the width at 64 and only changes which mat-mul path is selected.
+            dev->props.simd_width  = 32;
+            dev->simd_width_probed = 0;
             {
                 NSError * perror = nil;
 
                 id<MTLLibrary> plib = [dev->mtl_device newLibraryWithSource:@"kernel void ggml_probe(device float * dst [[buffer(0)]], uint tpig [[thread_position_in_grid]]) { dst[tpig] = 0.0f; }"
                                                                     options:nil
                                                                       error:&perror];
-                if (plib) {
+                if (!plib) {
+                    GGML_LOG_ERROR("%s: SIMD width probe: failed to compile the probe library: %s\n", __func__,
+                            perror ? [[perror description] UTF8String] : "unknown error");
+                } else {
                     id<MTLFunction> pfun = [plib newFunctionWithName:@"ggml_probe"];
-                    if (pfun) {
+                    if (!pfun) {
+                        GGML_LOG_ERROR("%s: SIMD width probe: failed to find the function 'ggml_probe' in the probe library\n", __func__);
+                    } else {
                         id<MTLComputePipelineState> pps = [dev->mtl_device newComputePipelineStateWithFunction:pfun error:&perror];
-                        if (pps) {
-                            dev->props.simd_width = (int) pps.threadExecutionWidth;
+                        if (!pps) {
+                            GGML_LOG_ERROR("%s: SIMD width probe: failed to create the probe pipeline state: %s\n", __func__,
+                                    perror ? [[perror description] UTF8String] : "unknown error");
+                        } else {
+                            dev->simd_width_probed = (int) pps.threadExecutionWidth;
                             [pps release];
                         }
                         [pfun release];
@@ -763,14 +853,20 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                     [plib release];
                 }
 
-                if (getenv("GGML_METAL_SIMD_WIDTH") != NULL) {
-                    const int w = atoi(getenv("GGML_METAL_SIMD_WIDTH"));
-                    if (w == 32 || w == 64) {
-                        GGML_LOG_WARN("%s: GGML_METAL_SIMD_WIDTH=%d overrides the probed width of %d\n", __func__, w, dev->props.simd_width);
-                        dev->props.simd_width = w;
-                    } else {
-                        GGML_LOG_WARN("%s: ignoring GGML_METAL_SIMD_WIDTH=%d - only 32 and 64 are supported\n", __func__, w);
+                if (dev->simd_width_probed == 32 || dev->simd_width_probed == 64) {
+                    dev->props.simd_width = dev->simd_width_probed;
+                } else {
+                    if (dev->simd_width_probed != 0) {
+                        GGML_LOG_ERROR("%s: SIMD width probe: reported an unsupported width of %d - only 32 and 64 are supported\n",
+                                __func__, dev->simd_width_probed);
+
+                        dev->simd_width_probed = 0;
                     }
+
+                    // falling through to 32 here is the *old* behaviour and it is wrong on wave64
+                    // hardware - say so, because the failure mode is out-of-bounds kernels.
+                    GGML_LOG_ERROR("%s: SIMD width probe: no usable width - falling back to %d, which is incorrect on wave64 GPUs\n",
+                            __func__, dev->props.simd_width);
                 }
             }
 
@@ -781,16 +877,44 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             // wave64 GPUs have no simdgroup_matrix support, so they get the register-tiled
             // kernel_mul_mm_w64 instead. GGML_METAL_MM_W64_DISABLE falls back to the mat-vec path.
-            dev->props.has_mm_w64 = (dev->props.simd_width == 64);
-            if (getenv("GGML_METAL_MM_W64_DISABLE") != NULL) {
-                dev->props.has_mm_w64 = false;
+            // note: the raw hardware probe is a necessary condition, so the 32-lane fallback that
+            //       a failed probe leaves in props.simd_width can never arm the wave64 GEMM. the
+            //       compiled width is required to be 64 as well - today the two can only differ
+            //       when the probe failed, but stating both keeps a 64-lane kernel from ever
+            //       being paired with a 32-lane library.
+            dev->props.has_mm_w64 =
+                !dev->props.has_simdgroup_mm &&
+                dev->simd_width_probed == 64 &&
+                dev->props.simd_width  == 64;
+            // value-aware, unlike a bare getenv() presence test: this is the dial the kernel
+            // comment advertises for A/B measurement, and MM_W64_DISABLE=0 disabling the GEMM
+            // would silently invert an experiment. "", "0", "false", "no", "off" all mean off.
+            {
+                const char * s = getenv("GGML_METAL_MM_W64_DISABLE");
+                if (s && !(s[0] == 0 ||
+                           strcmp(s, "0") == 0 ||
+                           strcasecmp(s, "false") == 0 ||
+                           strcasecmp(s, "no") == 0 ||
+                           strcasecmp(s, "off") == 0)) {
+                    if (dev->props.has_mm_w64) {
+                        GGML_LOG_INFO("%s: GGML_METAL_MM_W64_DISABLE=%s - wave64 mat-mul off, using mat-vec\n", __func__, s);
+                    }
+                    dev->props.has_mm_w64 = false;
+                }
             }
 
             // mat-vec -> mat-mul crossover. 8 and 32 are the upstream defaults, tuned on Apple
             // GPUs; on this card the fork measured batching only becoming cheap above ~32, so
             // these want sweeping per device rather than inheriting.
-            dev->props.mm_min    = getenv("GGML_METAL_MM_MIN")    ? atoi(getenv("GGML_METAL_MM_MIN"))    : 8;
-            dev->props.mm_id_min = getenv("GGML_METAL_MM_ID_MIN") ? atoi(getenv("GGML_METAL_MM_ID_MIN")) : 32;
+            //
+            // note: 8 is unmeasured on this card and wants a sweep - but the dials may only move
+            //       the crossover, never remove it: mm_min = 0 would push every single-token
+            //       mat-vec through the GEMM.
+            dev->props.mm_min    = 8;
+            dev->props.mm_id_min = 32;
+
+            ggml_metal_getenv_int("GGML_METAL_MM_MIN",    1, 4096, &dev->props.mm_min);
+            ggml_metal_getenv_int("GGML_METAL_MM_ID_MIN", 1, 4096, &dev->props.mm_id_min);
 
             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
@@ -938,7 +1062,9 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
-            dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            dev->props.op_offload_min_batch_size  = 32;
+
+            ggml_metal_getenv_int("GGML_OP_OFFLOAD_MIN_BATCH", 1, 1048576, &dev->props.op_offload_min_batch_size);
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
             dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
@@ -1144,10 +1270,46 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+// the iq1_* / iq2_* / iq3_* mat-vec kernels hardcode a 32-lane SIMD group: they seed threadgroup
+// scratch with `pos = (32*sgitg + tiisg)*nval` and stride their block loop by a literal 32. at 64
+// lanes tiisg reaches 63, so pos runs past both the threadgroup allocation and the constant grid
+// tables - an out-of-bounds write and an out-of-bounds read - and the block loop double-counts.
+// refuse these types here so the tensor falls back to another backend (CPU) instead of faulting.
+//
+// iq4_nl and iq4_xs are wave-generic (they index with N_SIMDWIDTH) and stay supported.
+static bool ggml_metal_type_supported_at_simd_width(ggml_metal_device_t dev, enum ggml_type type) {
+    if (dev->props.simd_width == 32) {
+        return true;
+    }
+
+    switch (type) {
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+            break;
+        default:
+            return true;
+    }
+
+    static atomic_flag warned = ATOMIC_FLAG_INIT;
+
+    if (!atomic_flag_test_and_set(&warned)) {
+        GGML_LOG_WARN("%s: refusing %s tensors: the iq1_*/iq2_*/iq3_* mat-vec kernels assume a 32-wide SIMD group and this device is %d-wide. these ops fall back to another backend\n",
+                __func__, ggml_type_name(type), dev->props.simd_width);
+    }
+
+    return false;
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
+    const int  simd_width              = dev->props.simd_width;
 
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
@@ -1352,10 +1514,28 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            {
+                // the kernel processes the head dimension one SIMD group at a time and asserts
+                // ne20 % GGML_METAL_NW(lib) == 0, so the capability check has to use the same width
+                if (!has_simdgroup_reduction || op->src[2]->ne[0] % simd_width != 0) {
+                    return false;
+                }
+
+                // ... and only kernel_gated_delta_net_f32_{1,2,4} are instantiated in
+                // ggml-metal.metal, so the simdgroup count has to land in that set. a shape with,
+                // say, ne20 = 192 at width 64 (or ne20 = 96 at width 32) gives nsg = 3, whose
+                // kernel name does not exist: the pipeline comes back NULL and the encoder
+                // dereferences it. refuse it here so the op falls back to another backend.
+                const int64_t nsg = op->src[2]->ne[0]/simd_width;
+
+                return nsg == 1 || nsg == 2 || nsg == 4;
+            }
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+            if (!ggml_metal_type_supported_at_simd_width(dev, op->src[0]->type)) {
+                return false;
+            }
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:

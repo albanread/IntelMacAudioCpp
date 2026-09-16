@@ -1027,7 +1027,7 @@ int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     nth = std::min(nth, (int) n);
 
-    const int nsg = (nth + 31) / 32;
+    const int nsg = (nth + GGML_METAL_NW - 1) / GGML_METAL_NW;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -2394,7 +2394,20 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // the simdgroup_matrix mat-mul kernel only works on A14+/M1+ SoCs; wave64 GPUs take
         // kernel_mul_mm_w64 instead, and older A-chips still fall through to the mat-vec path
         (props_dev->has_simdgroup_mm ||
-         (props_dev->has_mm_w64 && ggml_metal_mul_mm_w64_supported(op->src[0]->type, op->src[1]->type))) &&
+         (props_dev->has_mm_w64 &&
+          ggml_metal_mul_mm_w64_supported(op->src[0]->type, op->src[1]->type) &&
+          // the wave64 GEMM indexes src1 by element (y[k]) instead of stepping by args.nb10, so
+          // it is only correct when src1 rows are contiguous. ggml_is_transposed() above only
+          // tests nb0 > nb1, so a view with a row stride in the fastest dimension passes it.
+          // this belongs in the branch CONDITION and not in the body: falling through to the
+          // mat-vec path is the pre-port behaviour for this shape, and an abort is not.
+          // NOTE: the mat-vec kernels are not nb10-aware either - grep args.nb10 and the only
+          // mat-mul-family readers are upstream kernel_mul_mm / kernel_mul_mm_id. so this does
+          // not make a strided src1 correct; it keeps the card doing what it did before the
+          // GEMM existed instead of killing the process. refusing the shape in supports_op
+          // would be the actual fix, upstream included.
+          // short-circuiting on has_simdgroup_mm keeps the condition bit-for-bit on Apple.
+          nb10 == ggml_type_size(op->src[1]->type))) &&
         ne00 >= 64 && ne11 > ne11_mm_min) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
@@ -2406,6 +2419,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    case GGML_TYPE_BF16: GGML_ASSERT(nb01 % 8  == 0); break;
         //    default: break;
         //}
+
+        // belt and braces: the branch condition above already routes a non-contiguous src1 to
+        // the mat-vec path, so this can only fire if the two tests drift apart. the predicate
+        // here mirrors use_w64 in get_pipeline_mul_mm() rather than the condition above.
+        if (!props_dev->has_tensor && props_dev->has_mm_w64) {
+            GGML_ASSERT(nb10 == ggml_type_size(op->src[1]->type));
+        }
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
 
@@ -4128,7 +4148,11 @@ int ggml_metal_op_conv_3d(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_conv_3d(lib, op);
 
     // 5. Grid mapping
-    int nth0 = 32; // Standard SIMD width for Apple Silicon
+    // threadgroup size along the flattened spatial dimension. despite what this used to say, it
+    // is NOT the SIMD width: kernel_conv_3d has no simdgroup operations, so this is a free tuning
+    // choice - but it is also the stride the kernel un-flattens with (it reads it back from
+    // threads_per_threadgroup), and the grid below is derived from it, so all three stay in step.
+    int nth0 = 32;
     int nth1 = 1;
     int nth2 = 1;
 

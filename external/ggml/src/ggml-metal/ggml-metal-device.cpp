@@ -669,7 +669,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
 
     GGML_ASSERT(op->src[5]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
+
+    // the kernel walks S_v one SIMD group at a time, so ne20 must be a whole number of them.
+    // ggml_metal_device_supports_op() applies the same `ne20 % simd_width` test against the same
+    // probed width, so the scheduler should never route a shape that fails here - in particular
+    // ne20 = 32 at width 64, which used to reach this function and produce nsg = 0.
+    // ne20 = 0 still satisfies the modulo and would give nsg = 0 and a kernel name that does not
+    // exist, so require the simdgroup count explicitly rather than inferring it.
     GGML_ASSERT(ne20 % GGML_METAL_NW(lib) == 0);
+
+    // ggml-metal.metal instantiates kernel_gated_delta_net_f32_{1,2,4} and nothing else, so nsg
+    // has to land in that set - `nsg >= 1` is not enough. nsg = 3 (ne20 = 192 at width 64, or
+    // ne20 = 96 at width 32) names a kernel that does not exist: newFunctionWithName returns nil,
+    // compile_pipeline logs and hands back a NULL pipeline, and ggml_metal_op_gated_delta_net
+    // then dereferences it inside ggml_metal_encoder_set_pipeline.
+    // ggml_metal_device_supports_op() refuses those shapes so they route to another backend and
+    // never reach here; this assert is the belt-and-braces copy of that test.
+    GGML_ASSERT((nsg == 1 || nsg == 2 || nsg == 4) &&
+            "only kernel_gated_delta_net_f32_{1,2,4} are instantiated in ggml-metal.metal");
 
     snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
     snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d", base, ne20, ne30, K);
@@ -755,14 +772,72 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
+// ---------------------------------------------------------------------------------------
+// host-side mirror of the kernel_mul_mm_w64 tile dials.
+//
+// the kernel cannot see these names and the host cannot see the kernel's, so the contract is
+// held by three things that must be edited together: the single instantiation list in
+// ggml-metal.metal, the static_asserts inside kernel_mul_mm_w64, and the asserts here.
+// everything the host computes for the w64 path - the C tile, the threadgroup memory size, the
+// bc_inp predicate, the thread count - is derived from these names rather than written as a
+// literal, so moving a dial on one side and not the other is a build or startup failure rather
+// than a silent out-of-bounds threadgroup write.
+//
+// these must match kernel_mul_mm_w64<..., MM_W64_NK, MM_W64_TN, MM_W64_UR> in ggml-metal.metal:
+//
+//   #define MM_W64_NR0 64               and the instantiated NK = 32, TN = 2
+//   #define MM_W64_TM   4
+//   #define MM_W64_NR1 (16*MM_W64_TN)
+// ---------------------------------------------------------------------------------------
+
+static constexpr int MM_W64_NK  = 32;             // k staged per step
+static constexpr int MM_W64_TM  = 4;              // rows of C per thread
+static constexpr int MM_W64_TN  = 2;              // cols of C per thread
+static constexpr int MM_W64_NR0 = 64;             // rows of C per threadgroup (M)
+static constexpr int MM_W64_NR1 = 16*MM_W64_TN;   // cols of C per threadgroup (N)
+
+// the kernel's thread -> tile mapping is hardwired to this many threads (4 wave64 simdgroups)
+static constexpr int MM_W64_NUM_THREADS = 256;
+
+static_assert((MM_W64_NR0/MM_W64_TM)*(MM_W64_NR1/MM_W64_TN) == MM_W64_NUM_THREADS,
+        "the w64 C tile must be covered by exactly MM_W64_NUM_THREADS threads, one TM x TN patch each");
+static_assert(MM_W64_NK % 16 == 0,
+        "stage A dequantizes 16 k at a time, so a staging step must be a whole number of those - "
+        "this is also what lets bc_inp be expressed as K % MM_W64_NK");
+
+// size in bytes of ONE threadgroup staging element, for ONE operand. kernel_mul_mm_w64 has two
+// independent staging types - S0 stages A (src0) into sa, S1 stages B (src1) into sb - and they
+// are chosen per operand, not as a pair. keep this in step with the instantiation list in
+// ggml-metal.metal.
+//
+// the rule: a staging type is float iff that operand's ggml type is F32, and half otherwise.
+//
+//   - f32 operand -> float. on wave64 the GEMM takes batched work that previously went to
+//     kernel_mul_mv_t_t<float,float>, which was fp32 end to end (T1 yl[NF] with T1 = float).
+//     staging an f32 operand through half would be a new, undeclared fp16 precision floor:
+//     values outside +/-65504 flush to inf and anything needing sub-2^-14 resolution is lost.
+//     it degrades quietly rather than failing, so it is not a trade to make silently - and it
+//     applies to the weights of f32 x f16 just as much as to the activations of q8_0 x f32.
+//   - f16 operand -> half. the value is already fp16 in memory, so widening the staging buffer
+//     doubles its cost and recovers nothing.
+//   - q8_0 src0 -> half. dequantize_q8_0 forms int8 * fp16-scale in fp32 and then casts to
+//     S0_4x4, so with S0 = half the narrowing already happens inside the dequantize call;
+//     that rounding costs ~2^-11 relative, well under q8_0's own ~2^-8 quantisation error.
+//     keeping half also halves sa.
+//
+// a mismatch between this and the template arguments in ggml-metal.metal is an out-of-bounds
+// threadgroup write, not a slow path: the kernel splits shmem at MM_W64_NR0*MM_W64_NK*sizeof(S0)
+// while the host sizes the whole allocation.
+static size_t ggml_metal_mul_mm_w64_stage_size(ggml_type t) {
+    return t == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
 
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
-
-    const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
     constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
     constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
@@ -773,6 +848,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     // wave64 devices have no simdgroup_matrix, so they get the register-tiled GEMM instead
     const bool use_w64 = !has_tensor && props->has_mm_w64;
+
+    // bounds-checked input path. for the simdgroup_matrix kernels the 32 is their own block
+    // size; for the w64 kernel it is the staging step, because stage A reads a whole
+    // 16-element vector per dequantize call with no per-element guard before the store, and
+    // k_pos runs to the end of the last MM_W64_NK step rather than to K. both are 32 today.
+    const bool bc_inp = use_w64
+        ? (op->src[0]->ne[0] % MM_W64_NK != 0)
+        : (op->src[0]->ne[0] % 32 != 0);
 
     // note: the w64 kernel bounds-checks every tile edge itself, so it has no bc_out variant
     const bool bc_out = has_tensor
@@ -821,13 +904,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else if (use_w64) {
-        // MM_W64_NR0 rows x 16*MM_W64_TN cols of C per threadgroup. these must match the
-        // single instantiation in ggml-metal.metal (NK = 32, TN = 2 -> a 64 x 32 tile)
-        res.nr0 = 64;
-        res.nr1 = 32;
+        // MM_W64_NR0 rows x MM_W64_NR1 cols of C per threadgroup (a 64 x 32 tile as shipped)
+        res.nr0 = MM_W64_NR0;
+        res.nr1 = MM_W64_NR1;
 
-        // NK*64 staged A elements + NK*NR1 staged B elements, both half
-        res.smem = (size_t) 32*(64 + 32)*sizeof(ggml_fp16_t);
+        // the same expression the kernel uses to lay out threadgroup memory:
+        //   sa = shmem,                                   [MM_W64_NK][MM_W64_NR0] of S0
+        //   sb = shmem + MM_W64_NR0*MM_W64_NK*sizeof(S0), [MM_W64_NK][MM_W64_NR1] of S1
+        // the two halves are sized independently, one per operand, so sa and sb can differ:
+        //
+        //   variant     S0     S1       sa     sb    smem
+        //   f32_f32     float  float  8192   4096   12288
+        //   f16_f32     half   float  4096   4096    8192
+        //   q8_0_f32    half   float  4096   4096    8192
+        //   f32_f16     float  half   8192   2048   10240
+        //   f16_f16     half   half   4096   2048    6144
+        //
+        // all five are under Metal's guaranteed 16 KB minimum; ggml_metal_op_mul_mat asserts
+        // the result against this device's real max_theadgroup_memory_size before encoding.
+        const size_t sz_a = ggml_metal_mul_mm_w64_stage_size(tsrc0);
+        const size_t sz_b = ggml_metal_mul_mm_w64_stage_size(tsrc1);
+
+        res.smem = (size_t) MM_W64_NK*MM_W64_NR0*sz_a
+                 + (size_t) MM_W64_NK*MM_W64_NR1*sz_b;
     } else {
         res.nr0 = 64;
         res.nr1 = 32;
@@ -836,6 +935,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+
+    if (use_w64) {
+        // ggml_metal_op_mul_mat dispatches GGML_METAL_NW(lib) x res.nsg threads, and every
+        // thread -> tile mapping in kernel_mul_mm_w64 is derived from its NUM_THREADS == 256.
+        // res.nsg comes from N_MM_SIMD_GROUP_X/Y, which are simdgroup_matrix tuning constants
+        // with no connection to this kernel, so check the product rather than assume it.
+        GGML_ASSERT(res.nsg*GGML_METAL_NW(lib) == MM_W64_NUM_THREADS &&
+                "kernel_mul_mm_w64 requires exactly 256 threads per threadgroup");
+    }
 
     return res;
 }

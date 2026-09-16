@@ -1620,7 +1620,7 @@ kernel void kernel_op_sum_f32(
     }
 
     // TODO: become function constant
-    const uint nsg = (ntg.x + 31) / 32;
+    const uint nsg = (ntg.x + N_SIMDWIDTH - 1) / N_SIMDWIDTH;
 
     float sumf = 0;
 
@@ -3447,7 +3447,6 @@ void mul_vec_q_n_f32_impl(
     const short NSG = FC_mul_mv_nsg;
 
     constexpr short NW = N_SIMDWIDTH;
-    constexpr short NQ = 16;
 
     const int nb = args.ne00/QK4_0;
 
@@ -6313,9 +6312,18 @@ kernel void kernel_flash_attn_ext_blk(
     const int32_t Q = FC_flash_attn_ext_blk_nqptg;
     const int32_t C = FC_flash_attn_ext_blk_ncpsg;
 
-    // note: the flash-attention kernels are not wave64-aware - they are pinned to the 32-lane
-    //       layout and the host disables FLASH_ATTN_EXT at runtime on wave64 devices.
-    //       on 32-wide devices this is identical to N_SIMDWIDTH.
+    // note: all four flash-attention kernels - kernel_flash_attn_ext_blk,
+    //       kernel_flash_attn_ext_impl, kernel_flash_attn_ext_vec and
+    //       kernel_flash_attn_ext_vec_reduce - assume 32-lane waves. none of them is
+    //       wave64-aware, which is why NW is pinned to 32 here instead of tracking
+    //       N_SIMDWIDTH. they are unreachable on this card only because
+    //       ggml_metal_device_supports_op() returns has_simdgroup_mm for
+    //       GGML_OP_FLASH_ATTN_EXT (ggml-metal-device.m), and has_simdgroup_mm is false on
+    //       AMD. that is a capability check which happens to exclude this card - it is NOT a
+    //       wave-width check, and it is NOT the audio.cpp-level AUDIOCPP_DISABLE_FLASH_ATTN
+    //       switch, which is a separate dial and not what makes any of this safe.
+    //       do not loosen that gate until all four kernels are ported to the probed width.
+    //       on 32-wide devices NW == 32 is identical to N_SIMDWIDTH.
     constexpr short NW  = 32;
 
     const int32_t i3 = tgpig[2]/args.ne32;
@@ -6449,9 +6457,18 @@ void kernel_flash_attn_ext_impl(
     constexpr short PV8  = PV/8;
   //constexpr short PV16 = PV/16;
 
-    // note: the flash-attention kernels are not wave64-aware - they are pinned to the 32-lane
-    //       layout and the host disables FLASH_ATTN_EXT at runtime on wave64 devices.
-    //       on 32-wide devices this is identical to N_SIMDWIDTH.
+    // note: all four flash-attention kernels - kernel_flash_attn_ext_blk,
+    //       kernel_flash_attn_ext_impl, kernel_flash_attn_ext_vec and
+    //       kernel_flash_attn_ext_vec_reduce - assume 32-lane waves. none of them is
+    //       wave64-aware, which is why NW is pinned to 32 here instead of tracking
+    //       N_SIMDWIDTH. they are unreachable on this card only because
+    //       ggml_metal_device_supports_op() returns has_simdgroup_mm for
+    //       GGML_OP_FLASH_ATTN_EXT (ggml-metal-device.m), and has_simdgroup_mm is false on
+    //       AMD. that is a capability check which happens to exclude this card - it is NOT a
+    //       wave-width check, and it is NOT the audio.cpp-level AUDIOCPP_DISABLE_FLASH_ATTN
+    //       switch, which is a separate dial and not what makes any of this safe.
+    //       do not loosen that gate until all four kernels are ported to the probed width.
+    //       on 32-wide devices NW == 32 is identical to N_SIMDWIDTH.
     constexpr short NW  = 32;
     constexpr short NQ  = Q/NSG;
     constexpr short SH  = 2*C; // shared memory per simdgroup (s_t == float)
@@ -7312,9 +7329,18 @@ kernel void kernel_flash_attn_ext_vec(
     constexpr short PV  = PAD2(DV, 128);
     constexpr short PV4 = PV/4;
 
-    // note: the flash-attention kernels are not wave64-aware - they are pinned to the 32-lane
-    //       layout and the host disables FLASH_ATTN_EXT at runtime on wave64 devices.
-    //       on 32-wide devices this is identical to N_SIMDWIDTH.
+    // note: all four flash-attention kernels - kernel_flash_attn_ext_blk,
+    //       kernel_flash_attn_ext_impl, kernel_flash_attn_ext_vec and
+    //       kernel_flash_attn_ext_vec_reduce - assume 32-lane waves. none of them is
+    //       wave64-aware, which is why NW is pinned to 32 here instead of tracking
+    //       N_SIMDWIDTH. they are unreachable on this card only because
+    //       ggml_metal_device_supports_op() returns has_simdgroup_mm for
+    //       GGML_OP_FLASH_ATTN_EXT (ggml-metal-device.m), and has_simdgroup_mm is false on
+    //       AMD. that is a capability check which happens to exclude this card - it is NOT a
+    //       wave-width check, and it is NOT the audio.cpp-level AUDIOCPP_DISABLE_FLASH_ATTN
+    //       switch, which is a separate dial and not what makes any of this safe.
+    //       do not loosen that gate until all four kernels are ported to the probed width.
+    //       on 32-wide devices NW == 32 is identical to N_SIMDWIDTH.
     constexpr short NW  = 32;
     constexpr short NL  = NW/NE; // note: this can be adjusted to support different head sizes and simdgroup work loads
     constexpr short SH  = 4*C;   // shared memory per simdgroup
@@ -7859,6 +7885,10 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     const uint64_t rid = tgpig;
 
+    // note: the fourth flash-attention kernel, and it assumes 32-lane waves too - iwg == tiisg
+    //       indexes the NWG <= 32 partial results of one row directly, and the simd_max/simd_sum
+    //       below reduce across exactly those lanes. see the note in kernel_flash_attn_ext_blk
+    //       for why this is unreachable today and what must not be loosened.
     const short iwg = tiisg;
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
@@ -10991,8 +11021,32 @@ kernel void kernel_mul_mm_w64(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     (void) sgitg;
 
-    threadgroup S0 * sa = (threadgroup S0 *)(shmem);                       // [MM_W64_NK][64]
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + MM_W64_NR0*MM_W64_NK*sizeof(S0)); // [MM_W64_NK][32]
+    // --- the host/kernel contract, made explicit ------------------------------------------
+    // this kernel is dispatched with exactly NUM_THREADS threads (4 wave64 simdgroups of 64
+    // lanes). every thread -> tile mapping below is derived from NUM_THREADS and the MM_W64_*
+    // dials rather than written as a literal, and the static_asserts turn a moved dial into a
+    // compile error instead of a silent out-of-bounds write past the end of sb.
+    constexpr short NUM_THREADS = 256;                 // 4 simdgroups x 64 lanes
+    constexpr short NTM  = MM_W64_NR0/MM_W64_TM;       // C-tile row groups          == 16
+    constexpr short NTH  = NUM_THREADS/2;              // threads per staging half   == 128
+    constexpr short ATPR = NTH/MM_W64_NR0;             // stage A: threads per row   == 2
+    constexpr short BVPT = MM_W64_NK*MM_W64_NR1/NTH;   // stage B: values per thread == 8
+
+    static_assert(MM_W64_NR0 == 16*MM_W64_TM,
+            "the tm/tn mapping needs exactly 16 row groups of MM_W64_TM rows");
+    static_assert(NTM*(MM_W64_NR1/MM_W64_TN) == NUM_THREADS,
+            "the C tile must be covered by exactly NUM_THREADS threads, one TM x TN patch each");
+    static_assert(NTH == ATPR*MM_W64_NR0,
+            "stage A: the first NTH threads must cover the NR0 rows exactly, ATPR per row");
+    static_assert(MM_W64_NK % (16*ATPR) == 0,
+            "stage A: NK must split into 16-k dequantize chunks, ATPR-way interleaved by parity");
+    static_assert(MM_W64_NK*MM_W64_NR1 % NTH == 0,
+            "stage B: the NK x NR1 tile must divide across the NTH == 128 staging threads");
+    static_assert(MM_W64_NK % BVPT == 0,
+            "stage B: a thread's run of BVPT k must stay inside one column of sb");
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);                       // [MM_W64_NK][MM_W64_NR0]
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + MM_W64_NR0*MM_W64_NK*sizeof(S0)); // [MM_W64_NK][MM_W64_NR1]
 
     const int K  = args.ne00;
     const int M  = args.ne0;
@@ -11007,9 +11061,9 @@ kernel void kernel_mul_mm_w64(
 
     const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
 
-    // this thread's 4x2 patch of the output tile
-    const short tm = (tiitg % 16) * MM_W64_TM;   // 0,4,..,60
-    const short tn = (tiitg / 16) * MM_W64_TN;   // 0,2,..,30
+    // this thread's MM_W64_TM x MM_W64_TN (4x2 as shipped) patch of the output tile
+    const short tm = (tiitg % NTM) * MM_W64_TM;   // 0,4,..,60
+    const short tn = (tiitg / NTM) * MM_W64_TN;   // 0,2,..,30
 
     float acc[MM_W64_TM][MM_W64_TN];
     FOR_UNROLL (short i = 0; i < MM_W64_TM; ++i) {
@@ -11026,16 +11080,16 @@ kernel void kernel_mul_mm_w64(
 
         // --- stage A: 64 rows x NK k. Each dequantize call yields 16 k; a thread
         //     covers the NK/32 chunks of one row that match its parity.
-        if (tiitg < 128) {
-            const short row   = tiitg / 2;              // 0..63
-            const short parity = tiitg % 2;
+        if (tiitg < NTH) {
+            const short row   = tiitg / ATPR;           // 0..63
+            const short parity = tiitg % ATPR;
 
             const int  gr = r0 + row;
             const bool row_ok = gr < M;
 
             device const char * rowp = src0 + args.nb01*gr + offset0;
 
-            FOR_UNROLL (short chunk = parity; chunk < MM_W64_NK/16; chunk += 2) {
+            FOR_UNROLL (short chunk = parity; chunk < MM_W64_NK/16; chunk += ATPR) {
                 const int k_pos = loop_k + chunk*16;
 
                 S0 vals[16];
@@ -11066,10 +11120,10 @@ kernel void kernel_mul_mm_w64(
                 }
             }
         } else {
-            // --- stage B: NK k x NR1 n, 128 threads; each covers the NK*NR1/128
-            //     values of one column, contiguous in k
-            const short t  = tiitg - 128;
-            const int   v0 = t*(MM_W64_NK*MM_W64_NR1/128);
+            // --- stage B: NK k x NR1 n, the other NTH == 128 threads; each covers the
+            //     BVPT == NK*NR1/NTH values of one column, contiguous in k
+            const short t  = tiitg - NTH;
+            const int   v0 = t*BVPT;
 
             const short n  = v0 / MM_W64_NK;
             const short k0 = v0 % MM_W64_NK;
@@ -11082,7 +11136,7 @@ kernel void kernel_mul_mm_w64(
                     + args.nb12*i12
                     + args.nb11*gc);
 
-            FOR_UNROLL (short i = 0; i < MM_W64_NK*MM_W64_NR1/128; ++i) {
+            FOR_UNROLL (short i = 0; i < BVPT; ++i) {
                 const int k = loop_k + k0 + i;
                 sb[(k0 + i)*MM_W64_NR1 + n] = (col_ok && k < K) ? (S1) y[k] : (S1) 0;
             }
@@ -11109,7 +11163,7 @@ kernel void kernel_mul_mm_w64(
     }
 
     // --- write out
-    device float * C = (device float *) dst + im*N*(size_t)M;
+    device float * C = (device float *) dst + (size_t) im*N*M;
 
     FOR_UNROLL (short j = 0; j < MM_W64_TN; ++j) {
         const int gc = r1 + tn + j;
@@ -11132,11 +11186,42 @@ typedef decltype(kernel_mul_mm_w64<half, half4x4, half, float4x4, 1, dequantize_
 //       mat-vec path it uses today; a combination that reaches get_pipeline_mul_mm without a
 //       variant here asserts, because there is no falling back to kernel_mul_mm on wave64
 //       hardware (it fails at pipeline creation, not at library compile).
-template [[host_name("kernel_mul_mm_w64_f32_f32")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, float4x4,   1, dequantize_f32,  float, float4x4, float, 32, 2, 32>;
-template [[host_name("kernel_mul_mm_w64_f16_f32")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, half4x4,    1, dequantize_f16,  half,  half4x4,  float, 32, 2, 32>;
-template [[host_name("kernel_mul_mm_w64_q8_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, 32, 2, 32>;
-template [[host_name("kernel_mul_mm_w64_f32_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, float4x4,   1, dequantize_f32,  float, float4x4, half,  32, 2, 32>;
-template [[host_name("kernel_mul_mm_w64_f16_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, half, half4x4,    1, dequantize_f16,  half,  half4x4,  half,  32, 2, 32>;
+//
+// note: the two threadgroup staging types are picked INDEPENDENTLY, one per operand - unlike
+//       upstream kernel_mul_mm, which stages everything as half. the rule is:
+//
+//           S0 (stages A / src0 into sa) is float iff src0 is F32, else half
+//           S1 (stages B / src1 into sb) is float iff src1 is F32, else half
+//
+//       which across the five variants below gives, with NK = 32, NR0 = 64, NR1 = 32:
+//
+//           variant     S0     S1       sa     sb    smem
+//           f32_f32     float  float  8192   4096   12288
+//           f16_f32     half   float  4096   4096    8192
+//           q8_0_f32    half   float  4096   4096    8192
+//           f32_f16     float  half   8192   2048   10240
+//           f16_f16     half   half   4096   2048    6144
+//
+//       why float for an F32 operand: on this card the w64 GEMM takes batched work that
+//       previously went to kernel_mul_mv_t_t<float,float> - fp32 end to end - so half staging
+//       would be a new, undeclared fp16 precision floor: values outside +/-65504 flush to inf
+//       and anything needing sub-2^-14 resolution is lost. that degrades quietly and sounds
+//       like artefacts rather than failing. it is not only the f32 x f32 case: f16_f32 and
+//       q8_0_f32 carry f32 ACTIVATIONS in src1 (q8_0_f32 is the NAR solve, the hottest tensor
+//       in the graph), and f32_f16 carries f32 WEIGHTS in src0.
+//       why half is still right elsewhere: an f16 operand is already fp16 in memory, so
+//       widening sa/sb recovers nothing; and a q8_0 src0 value is int8 * fp16-scale, which
+//       dequantize_q8_0 has already cast down to S0_4x4 == half4x4 before it ever reaches sa -
+//       ~2^-11 of rounding, an order under q8_0's own ~2^-8 quantisation error. keeping half
+//       there also halves sa.
+//       ggml_metal_library_get_pipeline_mul_mm() in ggml-metal-device.cpp sizes threadgroup
+//       memory from the same per-operand rule - the two must be changed together, or the host's
+//       allocation and the kernel's sa/sb split disagree and stage B writes out of bounds.
+template [[host_name("kernel_mul_mm_w64_f32_f32")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<float, float4x4, float, float4x4,   1, dequantize_f32,  float, float4x4, float, 32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_f16_f32")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half,  half4x4,  float, half4x4,    1, dequantize_f16,  half,  half4x4,  float, 32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_q8_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half,  half4x4,  float, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, 32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_f32_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<float, float4x4, half,  float4x4,   1, dequantize_f32,  float, float4x4, half,  32, 2, 32>;
+template [[host_name("kernel_mul_mm_w64_f16_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half,  half4x4,  half,  half4x4,    1, dequantize_f16,  half,  half4x4,  half,  32, 2, 32>;
 
 //
 // indirect matrix-matrix multiplication
