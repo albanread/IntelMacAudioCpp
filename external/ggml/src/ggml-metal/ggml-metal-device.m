@@ -677,6 +677,50 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
     if (dev->mtl_device == nil) {
         dev->mtl_device = MTLCreateSystemDefaultDevice();
 
+        // on multi-GPU systems the system default device is not necessarily the most capable one - for
+        // example, on Intel Macs it is the GPU driving the main display, which can be the weaker card.
+        // GGML_METAL_DEVICE selects a device explicitly, either by index into MTLCopyAllDevices() or by
+        // a case-insensitive substring of the device name
+        {
+            const char * sel = getenv("GGML_METAL_DEVICE");
+
+            if (sel != NULL) {
+                NSArray * devices = MTLCopyAllDevices();
+
+                id<MTLDevice> selected = nil;
+
+                char * end = NULL;
+                const long idx = strtol(sel, &end, 10);
+
+                if (end != sel && *end == '\0') {
+                    if (idx >= 0 && idx < (long) [devices count]) {
+                        selected = [devices objectAtIndex:idx];
+                    }
+                } else {
+                    NSString * name = [NSString stringWithUTF8String:sel];
+
+                    for (id<MTLDevice> cur in devices) {
+                        if ([[cur name] rangeOfString:name options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                            selected = cur;
+                            break;
+                        }
+                    }
+                }
+
+                if (selected != nil) {
+                    [selected retain];
+                    [dev->mtl_device release];
+                    dev->mtl_device = selected;
+
+                    GGML_LOG_INFO("%s: GGML_METAL_DEVICE='%s' selected device: %s\n", __func__, sel, [[selected name] UTF8String]);
+                } else {
+                    GGML_LOG_WARN("%s: GGML_METAL_DEVICE='%s' did not match any device - using the system default\n", __func__, sel);
+                }
+
+                [devices release];
+            }
+        }
+
         if (dev->mtl_device) {
             dev->mtl_queue = [dev->mtl_device newCommandQueue];
             if (dev->mtl_queue == nil) {

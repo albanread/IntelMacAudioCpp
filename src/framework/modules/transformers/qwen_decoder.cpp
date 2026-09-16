@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "engine/framework/modules/transformers/qwen_decoder.h"
 
 #include "engine/framework/modules/activation_modules.h"
@@ -294,6 +295,12 @@ struct QKVProjections {
 };
 
 bool flash_branches_allowed(const QwenDecoderLayerConfig & config) {
+    // AMD GPUs have no flash attention kernel under Metal: it needs simdgroup matrix multiply,
+    // which is gated on MTLGPUFamilyApple7. Set AUDIOCPP_DISABLE_FLASH_ATTN to take the explicit path.
+    static const bool disabled = getenv("AUDIOCPP_DISABLE_FLASH_ATTN") != nullptr;
+    if (disabled) {
+        return false;
+    }
     return config.runtime.attention.allow_flash_attention;
 }
 

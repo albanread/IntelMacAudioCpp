@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "engine/models/yue2/nar_runtime.h"
 
 #include "engine/framework/core/backend.h"
@@ -261,6 +262,15 @@ core::TensorValue repeat_kv_heads(core::ModuleBuildContext & ctx, const core::Te
         core::TensorShape::from_dims({batch, kv_heads * repeats, steps, dim}));
 }
 
+namespace {
+// The Metal flash kernel needs simdgroup matrix multiply, which is gated on MTLGPUFamilyApple7, so
+// AMD GPUs do not have it. This lets the explicit path below be used instead.
+bool flash_attn_disabled() {
+    static const bool disabled = getenv("AUDIOCPP_DISABLE_FLASH_ATTN") != nullptr;
+    return disabled;
+}
+}  // namespace
+
 core::TensorValue mixed_attention(
     core::ModuleBuildContext & ctx,
     const core::TensorValue & q,
@@ -273,7 +283,7 @@ core::TensorValue mixed_attention(
     q_heads = core::wrap_tensor(ggml_cont(ctx.ggml, q_heads.tensor), q_heads.shape, q_heads.type);
     auto k_heads = engine::modules::TransposeModule({{0, 2, 1, 3}, k.shape.rank}).build(ctx, k);
     auto v_heads = engine::modules::TransposeModule({{0, 2, 1, 3}, v.shape.rank}).build(ctx, v);
-    if (backend_type != core::BackendType::Cpu) {
+    if (backend_type != core::BackendType::Cpu && !flash_attn_disabled()) {
         auto * flash = ggml_flash_attn_ext(
             ctx.ggml,
             q_heads.tensor,
