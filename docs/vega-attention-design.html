@@ -87,14 +87,32 @@ a{color:var(--blue)}
 <header>
   <div class="eyebrow">IntelMacAudioCpp · analysis and design · 16 September 2026</div>
   <h1>Attention for the Vega II, designed from its requirements</h1>
-  <p class="thesis">At batch-1 decode the Vega II already runs attention faster than an M4 Max — 11.8 µs per context token against 13.3 — and loses only because it is refused the better algorithm. This is the specification of that algorithm, written for a 64-wide machine with a large register file and no matrix units, phase by phase.</p>
+  <p class="thesis">With flash attention off, the M4 Max degrades with context; with it on, it does not. The Vega II is refused it by a vendor-family test. That control is the whole case — the gap is the software, not the silicon — This is the specification of that algorithm, written for a 64-wide machine with a large register file and no matrix units, phase by phase.</p>
   <div class="stamp">
     <span>target <b>YuE2-3B · q8_0 · decode</b></span>
     <span>machine <b>Radeon Pro Vega II · Vega 20 · GCN 5.1</b></span>
-    <span>measured floor <b>3.9 ms/token</b></span>
+    <span>KV cache on Metal <b>F32 · 512 B rows · 224 KiB/token</b></span>
     <span>measured now <b>80 ms/token @ 5,396</b></span>
   </div>
 </header>
+
+<section>
+<h2>Corrections applied after verification</h2>
+<div class="prose">
+<p>Three agents checked the machine, the workload and Apple's assumptions against the user's oracles and the engine source after this page was first published. Some of what they found reverses the original, so it comes first.</p>
+</div>
+<dl class="req">
+  <dt>KV dtype</dt><dd><b>The cache is F32 on Metal, not F16.</b> 512-byte rows, 224 KiB per token. The F16 path exists but is gated to CUDA/HIP/Vulkan. The kernel takes dtype as a parameter; F16 is free 2× headroom later.</dd>
+  <dt>R0, new</dt><dd><b>The explicit path's dominant cost is data movement this design had not identified.</b> Per layer it <code>REPEAT</code>s K and V from 8 heads to 16 and does four <code>CONT</code>s — six dispatches that only reshape, measured at <b>56% of step time</b>. QK^T is not starved (104,512 independent dots at batch 2); only the AV reduction is. Consume the native <code>[128, 8, S, B]</code> layout, index GQA, never materialise: one dispatch per layer replaces nine.</dd>
+  <dt>R5a, new</dt><dd><b>The runtime over-scans.</b> Cost tracks <i>allocated</i> cache steps (prefix + 5,120), not live context. A <code>valid_steps</code> bound with per-block early exit recovers ~24% of the context term.</dd>
+  <dt>range</dt><dd>Design for S = 4,000–12,000, common case 7,837 — not 24,576, which is the NAR ceiling the AR never reaches.</dd>
+  <dt>fixed floor</dt><dd><b>It is dispatch.</b> After a perfect attention kernel 11.24 ms/token remains: 2.43 ms of weight traffic and <b>8.81 ms of 1,013 serialised dispatches at 8.7 µs each</b>. Attention fusion removes 168 of them; the FFN chain is the rest.</dd>
+  <dt>withdrawn</dt><dd>"The Vega II beats the M4 Max on the same algorithm." The M4 Max's FA-off path is a different lowering (<code>FlashGroupedViewKV</code>, no CONT/REPEAT chain) and the Vega sweep ran CFG batch 2 where the song ran batch 1. Not the same graph. The conclusion stands on the FA-on/FA-off control alone.</dd>
+  <dt>Phase A</dt><dd><b>Cannot be chosen on paper.</b> Lane-per-key needs L1 to hold 4 KiB per wave — 128 KiB at the occupancy R2 demands, against 16 KiB. And at head_dim 128 a 64-wide wave handles <b>two KV rows per instruction</b> in the lane-per-dim mapping, 1 KiB contiguous: wave64 is a structural fit there, not a cost. The register file is unobservable on this toolchain, so the mapping is measured — both are comptime variants of <code>attention_bench.mojo</code>.</dd>
+  <dt>measured</dt><dd>ILP knee <b>8 chains per lane</b> (94% of peak). Occupancy ladder for 256-thread threadgroups: <b>1 TG/CU → 0.97×, 4 → 1.70×, 16 → 1.95×</b> — the grid must reach ≥ 256 threadgroups, ideally ~1,024, so block size is a swept parameter. Bandwidth ceiling is instrument-dependent (647 triad vs 830 copy); this page quotes 647.</dd>
+  <dt>hazards</dt><dd>Threadgroup size from the probed width (a constant silently halves at 64 → NaNs, no error); barriers and cross-lane ops <code>convergent</code>; <code>simd_ballot</code> i64; <code>llvm.vector.reduce</code> expanded by hand.</dd>
+</dl>
+</section>
 
 <section>
 <h2>The curve we are chasing</h2>
@@ -132,7 +150,7 @@ a{color:var(--blue)}
   <text class="cap" x="520" y="272" fill="var(--blue)">M4 Max, FA on · flat ≈ 9.5</text>
 </svg>
 </div>
-<figcaption>Measured 16 Sep 2026, two repeats per point, <code>cot=off</code>, identical request. Slopes: M4 Max without FA <b>13.3 µs</b> per context token; Vega II <b>11.8 µs</b>. The Vega II line sits below the M4 Max line at 3,200. The dashed red line is the only speed claim this design makes: the Vega II's curve must go flat at its own intercept.</figcaption>
+<figcaption>Measured 16 Sep 2026, two repeats per point, <code>cot=off</code>, identical request. Slopes: M4 Max without FA <b>13.3 µs</b> per context token; Vega II <b>11.8 µs</b>. The Vega II line sits below the M4 Max FA-off line at 3,200, but the two are not the same graph (different lowering; batch 2 vs 1), so read only the shapes: flat with FA, linear without. The dashed red line is the only speed claim this design makes: the Vega II's curve must go flat at its own intercept.</figcaption>
 </figure>
 <div class="prose">
 <p>What was eliminated on the way here, each by measurement rather than reasoning: bandwidth (80 ms/token against a 3.9 ms traffic floor — 69× off), host-side dispatch (<code>GGML_METAL_N_CB</code> 1→8 changes nothing; CPU 11% busy), and concurrent dispatch (3%, and disabled anyway for producing wrong results). What remains is occupancy: sixteen threadgroups of serial work on a card that wants two and a half thousand waves in flight.</p>
@@ -145,7 +163,7 @@ a{color:var(--blue)}
 <dl class="req">
   <dt>R1</dt><dd><b>Parallelism must come from the context dimension.</b> At batch 1 there are 16 heads of work (32 under CFG) for 64 CUs and ~2,560 wave slots. Heads and batch are exhausted; only the KV range is long. Split it into blocks; give each block its own workers; combine.</dd>
   <dt>R2</dt><dd><b>Hide DRAM latency by wave switching, so keep each lane's live state small.</b> GCN covers memory latency with ready waves, not cache. Occupancy is set by VGPRs per lane. Attention at decode is traffic-shaped — 619 MB of KV per token against ~7 MFLOP — so it wants occupancy, not the register blocking that served the GEMM.</dd>
-  <dt>R3</dt><dd><b>Read every K and V row coalesced, once.</b> A row is head_dim 128 × f16 = 256 bytes. A wave64 instruction is 64 lanes. Whether a row is one clean access or 64 scattered ones is decided entirely by the lane→data mapping, which is therefore a requirement, not a detail.</dd>
+  <dt>R3</dt><dd><b>Read every K and V row coalesced, once.</b> A row is head_dim 128 × <b>f32 = 512 bytes</b> as allocated today (f16 = 256 B by parameter). A wave64 instruction is 64 lanes. Whether a row is one clean access or 64 scattered ones is decided entirely by the lane→data mapping, which is therefore a requirement, not a detail.</dd>
   <dt>R4</dt><dd><b>Exploit GQA 2:1.</b> <code>num_key_value_heads = 8</code> serve <code>num_attention_heads = 16</code>. Process both query heads of a KV head in the same threadgroup and K/V traffic halves: 619 → 310 MB per token at 8,000 context.</dd>
   <dt>R5</dt><dd><b>Combine partials exactly with the online-softmax identity.</b> Blocks yield (m, l, o[128]); merging is <span class="mono">m = max(m₁,m₂); l = l₁e^(m₁−m) + l₂e^(m₂−m); o likewise</span>. Intrinsic to attention. Since dispatch cost is measured to be negligible here, a second reduce kernel is acceptable.</dd>
   <dt>R6</dt><dd><b>fp32 accumulation; exp must not dominate.</b> ~3.6 M exponentials per token (8,000 × 16 heads × 28 layers). Even at quarter rate that is microseconds. Running max, sum and accumulators stay fp32.</dd>
@@ -232,15 +250,16 @@ a{color:var(--blue)}
 <dl class="spec">
   <dt>grid</dt><dd><span class="mono">(8, ⌈ctx/256⌉, batch)</span> threadgroups. Batch is 1, or 2 under CFG (positive and negative prompts).</dd>
   <dt>threadgroup</dt><dd>256 threads, 4 waves. <span class="mono">threadExecutionWidth = 64</span> is asserted by the probe on every pipeline already.</dd>
-  <dt>block</dt><dd>256 keys. Chosen so one wave = 64 keys = one key per lane, and four waves amortise one Q load and one partial write. Not a tuned constant — a structural one.</dd>
+  <dt>block</dt><dd><b>Swept, 64–512.</b> Measured occupancy ladder for 256-thread threadgroups: 1 TG/CU → 0.97×, 4 → 1.70×, 16 → 1.95×, so the grid must reach ≥ 256 threadgroups at S ≈ 7,800 and ideally ~1,024. BLOCK 256 gives 256 TGs there; BLOCK 64 gives 1,000.</dd>
+  <dt>valid_steps</dt><dd>Per-block early exit at the live bound (R5a). Blocks entirely past it are never launched into work; the last block masks per lane.</dd>
   <dt>serves</dt><dd>query heads <span class="mono">2h</span> and <span class="mono">2h+1</span> of KV head <span class="mono">h</span>. Two independent accumulator sets per lane.</dd>
 </dl>
 </section>
 
 <section>
-<h2>Phase A — scores · lane ↔ key</h2>
+<h2>Phase A — scores · two candidate mappings, decided by the bench</h2>
 <div class="prose">
-<p>The score for key <i>j</i> is a 128-long dot product with Q. There are two natural lane mappings and they are not equivalent on this hardware. Lane-per-dimension needs a 64-lane reduction per key — 6 shuffle steps each, 64 times per block. Lane-per-key needs none: every lane forms its own dot product and Q is a broadcast. This is the GEMV mapping an AMD programmer writes first; Apple's kernel cannot use it because <code>simdgroup_matrix</code> fixes the mapping for it.</p>
+<p>The score for key <i>j</i> is a 128-long dot product with Q. Two mappings, both comptime variants of <code>attention_bench.mojo</code>. <b>(a) lane ↔ key</b>, drawn below: every lane forms its own dot product, Q is a broadcast, zero cross-lane ops — but 64 rows 4,096 B apart per instruction, resting on L1. <b>(b) lane ↔ dim, two keys per wave:</b> 32 lanes × float4 cover one 512 B row, so a 64-lane wave reads two keys per instruction, 1 KiB contiguous, then a 5-step shuffle reduction over 32 lanes per key pair, with ≤ 8 accumulator chains per lane (the measured ILP knee). (b) is the structurally coalesced one and wave64 <i>halves</i> its softmax and barrier count per key relative to Apple's 32-wide blocks. The register file cannot be read on this toolchain, so this is decided by throughput, as the fork's own <code>nr0</code> sweep was.</p>
 </div>
 <figure>
 <div class="diagram">
@@ -295,14 +314,15 @@ a{color:var(--blue)}
   <text class="lbl" x="180" y="308">so the 64 lanes' live segments total 4 KB — held in L1 across the loop. Plan B if it thrashes: stage K via LDS.</text>
 </svg>
 </div>
-<figcaption>Lane <i>j</i> owns key <i>j</i>. Q for both heads sits in LDS and is read as a broadcast, so the inner loop is pure independent FMA: 128 per head per lane, 256 per lane. Zero <code>simd_shuffle</code>. The row stride across lanes is absorbed by L1 because each lane drains its own 64-byte segments over the loop.</figcaption>
+<figcaption>Variant (a). Lane <i>j</i> owns key <i>j</i>; Q for both heads is an LDS broadcast; the inner loop is pure independent FMA. Its whole bet is that L1 absorbs the row stride — 4 KiB per wave, 128 KiB per CU at the occupancy the design needs, against a 16 KiB L1. Variant (b) makes no such bet.</figcaption>
 </figure>
 <dl class="spec">
   <dt>input</dt><dd><span class="mono">K[block]</span>: 64 rows × 128 × f16 per wave, from the KV cache at stride <span class="mono">nb_k</span> per key. <span class="mono">Q₀,Q₁</span>: staged once per threadgroup into LDS as fp32, RoPE already applied upstream.</dd>
   <dt>lane state</dt><dd><span class="mono">s₀, s₁</span> fp32 accumulators; loop counter; one f16x2 load register. ~5 VGPRs live.</dd>
   <dt>arithmetic</dt><dd>128 × 2 FMAs per lane. Loads: 128 halves per lane as 64 × 4-byte packed loads, converted to fp32 in-register.</dd>
   <dt>cross-lane</dt><dd>None.</dd>
-  <dt>memory</dt><dd>Per lane 256 B contiguous. Per wave 16 KB per block (64 rows). L1 pressure: 64 live 64-B segments = 4 KB — well within a 16 KB L1. <b>This is the one assumption to measure first</b> (see Plan B).</dd>
+  <dt>memory (a)</dt><dd>Per lane 512 B contiguous; rows 4,096 B apart across lanes. L1 pressure 4 KiB per wave, <b>128 KiB per CU at 8 TGs/CU against a 16 KiB L1.</b> Expected to thrash; the bench decides.</dd>
+  <dt>memory (b)</dt><dd>1 KiB contiguous per wave instruction (two 512 B rows), fully coalesced; 4 FMAs then a 5-rung shuffle ladder per key pair, generated from the width.</dd>
   <dt>tail</dt><dd>Lanes whose key index ≥ context set <span class="mono">s = −∞</span> and skip loads. Because a wave is exactly 64 keys, the tail is a single lane predicate, not a loop bound.</dd>
   <dt>serves</dt><dd>R1, R3, R4.</dd>
 </dl>
@@ -534,24 +554,24 @@ a{color:var(--blue)}
 <table>
 <thead><tr><th>Traffic per decoded token, per layer, at 8,000 context</th><th>explicit path today</th><th>this design</th></tr></thead>
 <tbody>
-<tr><td>K read</td><td class="n">8,000 × 8 heads × 256 B × 2 (per q head) = 32.8 MB</td><td class="n">16.4 MB — once per KV head (R4)</td></tr>
-<tr><td>V read</td><td class="n">32.8 MB</td><td class="n">16.4 MB</td></tr>
+<tr><td>K read (f32 rows)</td><td class="n">materialised to 16 heads: 8,000 × 16 × 512 B = 65.5 MB, plus the REPEAT/CONT writes that produce it</td><td class="n">32.8 MB — once per KV head (R4), read in place (R0)</td></tr>
+<tr><td>V read (f32 rows)</td><td class="n">65.5 MB + materialisation</td><td class="n">32.8 MB</td></tr>
 <tr><td>score matrix write + read</td><td class="n">≥ 2 × 16 × 8,000 × 4 B = 1.0 MB, plus softmax passes</td><td class="n">0 — never materialised</td></tr>
 <tr><td>partials</td><td class="n">—</td><td class="n">33 KB write + read</td></tr>
-<tr><td><b>× 28 layers</b></td><td class="n"><b>≈ 1.9 GB</b></td><td class="n"><b>≈ 0.92 GB → 1.4 ms at 647 GB/s</b></td></tr>
+<tr><td><b>× 28 layers</b></td><td class="n"><b>≈ 3.7 GB + reshape traffic</b></td><td class="n"><b>≈ 1.84 GB → 2.8 ms at 647 GB/s (1.4 ms at f16)</b></td></tr>
 </tbody>
 </table>
 </div>
-<div class="prose"><p>Traffic halves, but that was never the problem — the explicit path's 1.9 GB is only 2.9 ms of bandwidth and it spends 66 ms. What this design changes is that the 0.92 GB is read by a thousand waves instead of sixteen threadgroups, so the card is finally bandwidth-shaped rather than latency-shaped. That is the whole argument, and it is the thing the flat curve will confirm or deny.</p></div>
+<div class="prose"><p>Two things change, and the measurement says the first is bigger: the six reshape dispatches per layer that were 56% of step time disappear (R0), and the remaining reads are done by ~1,000 waves instead of sixteen threadgroups (R1/R2). Then the over-scan stops (R5a). What the flat curve confirms or denies is whether, after all three, the card is bandwidth-shaped.</p></div>
 </section>
 
 <section>
 <h2>What is genuinely harder here</h2>
 <div class="prose">
 <div class="note">
-<p><b>Phase A's row stride is the one assumption the design rests on.</b> Sixty-four lanes reading rows 256 bytes apart is uncoalesced at the instruction level; it works only if L1 holds the 64 live 64-byte segments across the inner loop. On paper that is 4 KB in a 16 KB L1. If measurement shows it thrashing — visible as Phase A running far below the bandwidth its traffic implies — <b>Plan B</b> is to stage the K block through LDS with a Phase-C-style coalesced load and a transpose: 16 KB per block, one extra barrier, still well inside the 64 KB LDS. The rest of the design is unchanged.</p>
+<p><b>The register file is unobservable.</b> Apple's driver lowers AIR→GCN as a black box; no VGPR count, no occupancy counter exists on this toolchain. The only instrument is end-to-end throughput plus the pipeline's reported max threads per threadgroup (1024 means light, 512/768 means register-heavy — this tree's own w64 GEMM reports 512). So every register figure on this page is a plan, and the bench brackets the blocking factor the way the fork's <code>nr0</code> sweep did. That is also why Phase A ships as two variants rather than one.</p>
 </div>
-<p>Two smaller costs, stated so they are not discovered later: every wave reduction is 6 shuffle steps rather than 5, and a kernel with two lane mappings is two mental models to get right rather than one. The second is also the source of most of the win.</p>
+<p>Smaller costs, stated so they are not discovered later: a wave reduction is 6 shuffle steps rather than 5 — but once per 64 keys rather than 32, so 3.3× cheaper per key than Apple's; and a kernel with two lane mappings is two mental models to get right. What the hazard list adds: threadgroup size must come from the probed width, barriers must be unconditional, ballot must be the i64 form, and reductions are expanded by hand.</p>
 <p>What is <i>not</i> harder: nothing here needs <code>simdgroup_matrix</code>, and nothing here needs a threadgroup size that is a multiple of 32 for its own sake. Those were consequences of Apple's design, not of attention.</p>
 </div>
 </section>
@@ -562,7 +582,7 @@ a{color:var(--blue)}
 <dl class="req">
   <dt>gate 1</dt><dd><b>Op-level.</b> <code>test-backend-ops -o FLASH_ATTN_EXT</code> at the real shapes (head_dim 128, n_q 1–2, ctx 64…8,192), one op under the 30 s watchdog, against the CPU reference. NMSE below the op's tolerance — a number, not an impression.</dd>
   <dt>gate 2</dt><dd><b>Per-tensor A/B on the card.</b> New kernel against the explicit path on identical inputs, via <code>GGML_METAL_FA_W64_DISABLE</code>. Max abs and NMSE per layer. This catches what the synthetic shapes miss.</dd>
-  <dt>gate 3</dt><dd><b>The curve.</b> ms/token at 200 / 800 / 1,600 / 3,200 / 6,400, two repeats. It must go flat — the dashed red line in the first figure. Phase A's stride assumption lives or dies here: a flat curve that sits far above the intercept means Plan B.</dd>
+  <dt>gate 3</dt><dd><b>The curve.</b> ms/token at 200 / 800 / 1,600 / 3,200 / 6,400, two repeats. It must go flat — the dashed red line in the first figure. Phase A's variant is chosen here, and a flat curve that sits far above the intercept means the fixed floor — dispatch — is next.</dd>
   <dt>gate 4</dt><dd><b>The oracle.</b> Waveform check — peak, full-scale count, level count — then the full song, then the headphones. In that order, as always. No timing number is quoted before gate 4 passes.</dd>
 </dl>
 </div>
@@ -570,7 +590,7 @@ a{color:var(--blue)}
 
 <footer style="margin-top:4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:.85rem;color:var(--muted)">
 <div class="eyebrow">sources</div>
-<p>Measurements: <span class="mono">bench/VEGA-II.md</span>, <span class="mono">fa-sweep/</span> in <span class="mono">/Volumes/xb/music</span>. Model: <span class="mono">yue2-model-config.json</span> — hidden 2048, 28 layers, 16 heads, 8 KV heads, head_dim 128. Card: the user's oracles at <span class="mono">/Volumes/S/oracles</span> — 647 GB/s triad, 830 GB/s copy, 13.1 TFLOP/s FMA. Fork: <a href="https://github.com/albanread/IntelMacAudioCpp">albanread/IntelMacAudioCpp</a>.</p>
+<p>Measurements: <span class="mono">bench/VEGA-II.md</span>, <span class="mono">fa-sweep/</span> in <span class="mono">/Volumes/xb/music</span>. Model: <span class="mono">yue2-model-config.json</span> — hidden 2048, 28 layers, 16 heads, 8 KV heads, head_dim 128. Card: the user's oracles at <span class="mono">/Volumes/S/oracles</span> — 64 CUs read from the driver, 647 GB/s triad (830 copy), 13.1 TFLOP/s FMA with the ILP knee at 8 chains, occupancy ladder from <span class="mono">RESULTS-vega2-reg.md</span>. Hazards: <span class="mono">/Volumes/S/mojo/AIR_on_AMD.md</span>. Engine layout: <span class="mono">audio.cpp</span> KV cache <span class="mono">[128, 8, S, B]</span> f32, from source and the op profile. Fork: <a href="https://github.com/albanread/IntelMacAudioCpp">albanread/IntelMacAudioCpp</a>.</p>
 </footer>
 </div>
 

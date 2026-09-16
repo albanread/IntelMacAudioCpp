@@ -108,10 +108,15 @@ NAR attends over the same growing context.
 designed for this machine rather than ported: see
 [docs/vega-attention-design.md](docs/vega-attention-design.md) (the page with diagrams is
 [docs/vega-attention-design.html](docs/vega-attention-design.html)). The control experiment behind
-it: with flash attention disabled, the M4 Max degrades at 13.3 µs per context token; the Vega II,
-which cannot enable it, degrades at 11.8 µs — the shallower slope, and faster in absolute terms at
-3,200 tokens. The gap is the algorithm, not the silicon. At batch-1 decode attention is GEMV, so no
-`simdgroup_matrix` is involved; only the two prefill kernels stay on the explicit path.
+it: with flash attention on, the M4 Max's per-token cost is flat in context; with it off, it is
+linear. The Vega II is refused flash attention by a vendor-family test and is linear too. The gap is
+the software, not the silicon. (An earlier version of this paragraph said the Vega II was *faster*
+than the M4 Max on the same algorithm; that is withdrawn — the M4 Max's FA-off path is a different
+lowering and the two sweeps ran different batch sizes, so the slopes are not the same graph.)
+At batch-1 decode attention is GEMV, so no `simdgroup_matrix` is involved. The design was revised
+after verification: the KV cache is **F32** on Metal (224 KiB/token, not 112), the explicit path's
+dominant cost is the `REPEAT`/`CONT` reshape chain (56% of step time), the runtime over-scans the
+allocated cache, and the fixed floor that remains is 1,013 dispatches per token at 8.7 µs each.
 
 The output is real audio at full length — peak 0.947, 0% clipped, 71,182 distinct levels, DC
 3.5e-5 — so this is an honest speed number, not a fast wrong answer.

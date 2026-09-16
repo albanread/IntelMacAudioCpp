@@ -1,6 +1,48 @@
 # Attention for the Vega II — designed from requirements, not ported
 
-*16 Sep 2026. Numbers marked ⟨verify⟩ are being confirmed against the user's own oracles.*
+*16 Sep 2026. Revised the same evening after three requirements agents checked the machine, the
+workload and Apple's assumptions against the user's oracles and the engine source. What they changed
+is listed first, because some of it reverses the original.*
+
+## Corrections applied after verification
+
+1. **The KV cache is F32 on Metal, not F16.** 512-byte rows, 224 KiB per token, 8 KiB per layer per
+   token. The F16 storage path exists in the engine but is gated to CUDA/HIP/Vulkan. The kernel takes
+   the dtype as a parameter; F16 is free 2x headroom later (R5 below).
+2. **The explicit path's dominant cost is data movement the design had not identified.** Per layer
+   the eager path `REPEAT`s K and V from 8 heads to 16 and does four `CONT`s: six dispatches that
+   exist only to reshape, measured at **56% of step time**. QK^T is not starved (104,512 independent
+   dot products at batch 2); only the AV reduction is. New R0: consume the native layout
+   `ne=[128, 8, S, B]`, `nb=[4, 512, 4096, 4096·S]` and index GQA; never materialise.
+3. **The runtime over-scans.** Cost tracks *allocated* cache steps (prefix + 5,120), not live context.
+   A `valid_steps` bound in the kernel recovers ~24% of the context term. New R6.
+4. **The operating range is S = 4,000–12,000, common case 7,837** — not 24,576, which is the NAR
+   ceiling the AR never reaches.
+5. **The fixed floor is dispatch.** After a perfect attention kernel, 11.24 ms/token remains: 2.43 ms
+   of weight traffic (the AR uses a compact 32,769-row `lm_head` view, 1.57 GB) and **8.81 ms of
+   1,013 serialised dispatches at 8.7 µs each**. Attention fusion removes 168 of them.
+6. **The "Vega II beats the M4 Max on the same algorithm" claim is withdrawn.** The M4 Max's FA-off
+   path is a different lowering (`FlashGroupedViewKV`, no CONT/REPEAT chain), and the Vega sweep ran
+   CFG batch 2 where the full song ran batch 1. The slopes were not the same graph. The conclusion —
+   the gap is the software, not the silicon — stands on the FA-on/FA-off control alone.
+7. **Phase A's mapping cannot be chosen on paper.** The lane-per-key variant relies on L1 holding
+   4 KiB per wave; at 8 threadgroups per CU that is 128 KiB against a 16 KiB L1. And at head_dim 128
+   a 64-wide wave handles **two KV rows per instruction** in the lane-per-dim mapping — 1 KiB
+   contiguous — so wave64 is a structural fit for that variant, not a cost. The register file is
+   unobservable on this toolchain (Apple's AIR→GCN is a black box; the only proxy is the pipeline's
+   reported max threads), so the mapping is a **measured** decision. Both variants are comptime
+   parameters of `attention_bench.mojo`.
+8. Measured on this card and now design inputs: the ILP knee is **8 independent chains per lane**
+   (94% of peak; 64 chains buys 6% more at 8x the registers); the occupancy ladder for 256-thread
+   threadgroups is **1 TG/CU → 0.97x, 4 → 1.70x, 16 → 1.95x**, so the grid must reach ≥256
+   threadgroups and ideally ~1,024; the block size is therefore a swept parameter, not structural.
+9. The bandwidth ceiling is instrument-dependent by 1.28x (647 GB/s STREAM triad vs 830 GB/s copy).
+   This document quotes **647** and says so.
+10. Hazards measured on this path that the kernel must satisfy: threadgroup size derived from the
+    probed wave width (a constant silently halves at 64 → NaNs, no error); cross-lane ops and barriers
+    `convergent` (else barriers are cloned per branch and lanes desynchronise silently);
+    `simd_ballot` in its i64 form; `llvm.vector.reduce.*` expanded by hand.
+
 
 The rule for this document: every design decision must trace to a requirement, and every requirement
 must trace to a measurement or to the machine. Nothing is here because Apple's kernel does it.
@@ -8,6 +50,13 @@ must trace to a measurement or to the machine. Nothing is here because Apple's k
 ---
 
 ## 1. The requirements
+
+### R0 — Consume the cache in its native layout; never materialise a 16-head copy
+
+Measured: six of the nine per-layer attention dispatches in the explicit path are `REPEAT` (8→16 heads)
+and `CONT`, and they are 56% of step time. The cache is `[128, 8, S, B]` with the eight KV heads of a
+token contiguous in 4,096 bytes. Query head *h* reads KV head *h/2* by indexing. One dispatch per layer
+for the whole attention region replaces nine.
 
 ### R1 — Parallelism must come from the context dimension, because nothing else has any
 
@@ -37,7 +86,7 @@ per token against 7 MFLOP of arithmetic — so it wants occupancy. Different pro
 
 ### R3 — Every K and V row must be read coalesced, exactly once
 
-A K or V row is head_dim 128 × f16 = 256 bytes ⟨verify dtype⟩. A wave64 memory instruction is
+A K or V row is head_dim 128 × **f32 = 512 bytes** as the engine allocates it on Metal today (f16 = 256 B is a parameter, not the default). A wave64 memory instruction is
 64 lanes; the coalescing unit is ⟨verify⟩ 64-byte segments. The lane→data mapping decides whether
 a row is one clean 256 B access or 64 scattered ones. The mapping is therefore a *requirement*, not
 a detail.
@@ -47,6 +96,13 @@ a detail.
 `num_key_value_heads = 8`, `num_attention_heads = 16`. Two query heads share each K/V head. If they
 are processed by the same threadgroup, K and V traffic halves: 619 MB → 310 MB per token at 8,000
 context. Nothing in the algorithm prevents it; it is a scheduling choice.
+
+### R5a — The kernel takes `valid_steps` and stops there
+
+Measured: the runtime allocates prefix + 5,120 cache steps and the explicit path scans all of them from
+the first generated token, so cost tracks allocation, not live context. A per-block early exit on
+`valid_steps` is worth ~24% of the context term on the full song's semantic stage — the largest single
+non-bandwidth change available.
 
 ### R5 — Partial results from context blocks must combine exactly
 
@@ -97,34 +153,38 @@ wave:        64 keys, one key per lane      (block of 256 keys = 4 waves × 64)
 each threadgroup serves BOTH query heads of its KV head   (R4)
 ```
 
-At context 8,000: 250 threadgroups × 4 waves = **1,000 waves**, each lane at ~16 VGPRs, so up to
-8 waves/SIMD are schedulable → the machine is full ⟨verify against the occupancy table⟩. At 1,000
-context it is 32 threadgroups / 128 waves — under-filled, but that regime costs 15 ms/token today
-and is not where the time goes.
+Block size is a **swept parameter** (64–512 keys per threadgroup), not a structural constant: the
+measured occupancy ladder on this card for 256-thread threadgroups is 1 TG/CU → 0.97x, 4 → 1.70x,
+16 → 1.95x, so the grid must reach ≥ 256 threadgroups at the common S ≈ 7,800 and ideally ~1,024.
+At S = 8,000 and 8 KV heads: BLOCK 256 gives 256 threadgroups; BLOCK 64 gives 1,000. The bench
+measures which pays.
 
-### 3.2 Three phases, two lane mappings — use each where it is natural
+### 3.2 Three phases — and Phase A's mapping is decided by measurement
 
-This is the part a straight port gets wrong. Apple's kernel uses one lane→data mapping throughout
-because `simdgroup_matrix` imposes it. We have no such constraint, so each phase gets the mapping
-that makes *its* memory access coalesced and *its* arithmetic shuffle-free.
+Apple's kernel uses one lane→data mapping throughout because `simdgroup_matrix` imposes it. We have no
+such constraint. Two candidate mappings for the score phase, both implemented as comptime parameters
+of `attention_bench.mojo`:
 
-**Phase A — scores, lane ↔ key.** Lane *j* owns key *j* of its wave's 64. It streams its K row
-(256 B, contiguous per lane; across lanes the 64 rows are 256 B apart, and each lane consumes its
-whole 64 B segments over the loop so L1 absorbs the stride ⟨verify L1 size⟩) and forms two dot
-products against Q₀ and Q₁, which sit in LDS and are read as conflict-free broadcasts. **128 FMAs
-per lane per head, zero cross-lane operations.** Every lane is independent. This is the GEMV
-mapping an AMD programmer writes first.
+**Phase A(a) — lane ↔ key.** Lane *j* owns key *j* of its wave's 64, streams its own 512 B row, forms two
+dot products against Q₀, Q₁ read from LDS as broadcasts. 256 FMAs per lane, zero cross-lane ops. Risk:
+64 rows 4,096 B apart per instruction, relying on L1 to hold 4 KiB per wave — 128 KiB at the
+occupancy R2 demands, against a 16 KiB L1. **Probably loses under load.**
 
-**Phase B — softmax, two reductions per block.** Each lane holds s₀ⱼ, s₁ⱼ. Wave-max via `simd_max`
-(6 steps at 64 lanes — once per block, not per key), then pⱼ = exp(sⱼ − m) per lane, then wave-sum.
-Two reductions per 64 keys per head. Write p to LDS (256 B per head).
+**Phase A(b) — lane ↔ dim, two keys per wave.** At head_dim 128, 32 lanes × float4 cover one row; a
+64-lane wave covers **two keys per instruction**, 1 KiB contiguous. Per key pair: 4 FMAs per lane then a
+5-step shuffle reduction over 32 lanes. Keep ≤ 8 independent accumulator chains per lane — the measured
+ILP knee. Wave64 halves the softmax and barrier count per key relative to Apple's 32-wide C. **The
+structurally coalesced one.**
 
-**Phase C — output, lane ↔ dim.** Now lane *d* owns output dims 2d, 2d+1. It loops over the 64 keys:
-*o[d] += pⱼ · V[j][d]*, with pⱼ read from LDS as a broadcast and V[j] read across lanes — 64 lanes ×
-4 B = one coalesced 256 B row per key. **128 FMAs per lane per head, zero cross-lane operations.**
+**Phase B — softmax.** Wave max, exp, wave sum — once per 64 keys, ladders generated from the wave
+width. p to LDS (512 B per head).
 
-Per lane, live state: 2 score accumulators, 2 output accumulators (2 dims × 2 heads = 4 floats),
-running m and l per head (4), loop temporaries. **~16 VGPRs.** That is what buys the occupancy in R2.
+**Phase C — output.** The mapping that matches the chosen Phase A: lane-per-dim with V rows read as
+whole coalesced rows across the wave, *p<sub>j</sub>* as an LDS broadcast. Zero cross-lane ops.
+
+Per-lane live state is the budget: the register file cannot be read on this toolchain, so the bench
+brackets the blocking factor by throughput, exactly as the fork's `nr0` sweep did (8 optimal, 16 and 32
+worse, with no register visibility at all).
 
 ### 3.3 Combining
 
@@ -154,12 +214,12 @@ today. It is not in the 67%. It stays as it is. The host gate becomes: use this 
 
 ## 4. What is genuinely harder here, stated honestly
 
-- **Phase A's stride.** Lane↔key means 64 lanes reading rows 256 B apart. It relies on L1 holding
+- **Phase A's stride (variant a only).** Lane↔key means 64 lanes reading rows 4,096 B apart (the head stride in the native layout). It relies on L1 holding
   64 lanes × 64 B = 4 KB of segments across the inner loop ⟨verify L1 is ≥16 KB and the access
   pattern does not thrash it⟩. If it does thrash, the fallback is staging K through LDS with a
   coalesced lane↔dim load and a transpose — 16 KB per block, well within 64 KB — at the cost of a
   barrier. That is the one place the design has a plan B.
-- **The reduction count is 6 steps not 5** per wave-max / wave-sum. Two per block per head. Not a
+- **The reduction count is 6 steps not 5** per wave-max / wave-sum — but once per 64 keys rather than 32, so 3.3x cheaper per key than Apple's. Two per block per head. Not a
   concern at this ratio of FMAs to shuffles, but it is the concrete cost of wave64.
 - **Two lane mappings means two mental models in one kernel.** It is more to get right than one
   mapping. It is also the source of most of the win.
