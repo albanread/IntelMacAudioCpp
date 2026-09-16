@@ -104,8 +104,14 @@ context. At a 24,576-token context that is ruinous, and a 200-token clip never s
 explains why NAR came in at 240 s when the clip's 4.98 s / 200 frames would have predicted 134 s:
 NAR attends over the same growing context.
 
-**So the next piece of work on this card is a wave64 `FLASH_ATTN_EXT`, not more GEMM tuning.** No
-such kernel exists in this tree or in llama.cpp's. Four flash-attention kernels would need porting.
+**So the next piece of work on this card is decode attention, not more GEMM tuning** — and it is
+designed for this machine rather than ported: see
+[docs/vega-attention-design.md](docs/vega-attention-design.md) (the page with diagrams is
+[docs/vega-attention-design.html](docs/vega-attention-design.html)). The control experiment behind
+it: with flash attention disabled, the M4 Max degrades at 13.3 µs per context token; the Vega II,
+which cannot enable it, degrades at 11.8 µs — the shallower slope, and faster in absolute terms at
+3,200 tokens. The gap is the algorithm, not the silicon. At batch-1 decode attention is GEMV, so no
+`simdgroup_matrix` is involved; only the two prefill kernels stay on the explicit path.
 
 The output is real audio at full length — peak 0.947, 0% clipped, 71,182 distinct levels, DC
 3.5e-5 — so this is an honest speed number, not a fast wrong answer.

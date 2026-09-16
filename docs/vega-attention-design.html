@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vega II Attention Design</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --ground:#F3F4F2; --surface:#FFFFFF; --ink:#1B1F24; --muted:#5C6470; --line:#D9DCD8;
+  --red:#B8262B; --red-soft:#F3DCDD; --blue:#3B6EA8; --blue-soft:#DCE6F2; --amber:#9A6B00; --amber-soft:#F5E9C8;
+  --grid:#E6E8E4; --mark:#1B1F24;
+  --display:"Bricolage Grotesque","Archivo",system-ui,sans-serif;
+  --body:"Source Sans 3","Segoe UI",system-ui,sans-serif;
+  --mono:"JetBrains Mono","SF Mono",Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#15181D; --surface:#1E2229; --ink:#E6E8EB; --muted:#9AA3AF; --line:#2E343D;
+    --red:#E0464B; --red-soft:#3A2224; --blue:#7FA6DA; --blue-soft:#1F2D3F; --amber:#D9A73A; --amber-soft:#3A3120;
+    --grid:#252A31; --mark:#E6E8EB; color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#15181D; --surface:#1E2229; --ink:#E6E8EB; --muted:#9AA3AF; --line:#2E343D;
+  --red:#E0464B; --red-soft:#3A2224; --blue:#7FA6DA; --blue-soft:#1F2D3F; --amber:#D9A73A; --amber-soft:#3A3120;
+  --grid:#252A31; --mark:#E6E8EB; color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--body);font-size:17px;line-height:1.55;padding-inline:20px;padding-block:0 96px}
+.wrap{max-width:960px;margin:0 auto}
+.prose{max-width:72ch}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;margin:0}
+h1{font-size:clamp(2.2rem,5vw,3.4rem);font-weight:700;line-height:1.02;letter-spacing:-.01em}
+h2{font-size:1.65rem;font-weight:700;margin-top:3.2rem;margin-bottom:.6rem;letter-spacing:-.005em}
+h3{font-size:1.15rem;font-weight:700;margin-top:1.6rem;margin-bottom:.35rem}
+p{margin:.6rem 0}
+.eyebrow{font-family:var(--mono);font-size:.74rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+header{padding-block:56px 24px;border-bottom:1px solid var(--line)}
+header .thesis{font-size:1.2rem;max-width:64ch;margin-top:1rem}
+.stamp{display:flex;flex-wrap:wrap;gap:8px 28px;margin-top:1.2rem;font-family:var(--mono);font-size:.8rem;color:var(--muted)}
+.stamp b{color:var(--ink);font-weight:600}
+code,.mono{font-family:var(--mono);font-size:.88em}
+code{background:var(--surface);border:1px solid var(--line);padding:.05em .35em;border-radius:3px}
+.note{border-left:3px solid var(--red);padding:.35rem 1rem;margin:1.2rem 0;background:var(--surface)}
+.note.blue{border-left-color:var(--blue)}
+figure{margin:1.4rem 0}
+figcaption{font-size:.9rem;color:var(--muted);margin-top:.5rem;max-width:72ch}
+.diagram{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px;overflow-x:auto}
+.diagram svg{display:block;width:100%;height:auto;max-width:100%}
+svg text{font-family:var(--mono);fill:var(--ink)}
+svg .lbl{font-size:11px;fill:var(--muted)}
+svg .cap{font-size:12px;font-weight:600}
+svg .ax{stroke:var(--line);stroke-width:1}
+svg .gr{stroke:var(--grid);stroke-width:1}
+table{border-collapse:collapse;width:100%;font-size:.95rem;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-family:var(--mono);font-size:.74rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+td.n{font-family:var(--mono);font-size:.86rem;white-space:nowrap}
+.tbl{overflow-x:auto;margin:1rem 0}
+.req{display:grid;grid-template-columns:5.5rem 1fr;gap:.2rem 1rem;margin:1.2rem 0;max-width:80ch}
+.req dt{font-family:var(--mono);font-size:.8rem;color:var(--red);font-weight:600;padding-top:.25rem}
+.req dd{margin:0 0 1.1rem}
+.req dd b{font-weight:600}
+.spec{display:grid;grid-template-columns:11rem 1fr;gap:.35rem 1.2rem;margin:1rem 0 1.6rem;max-width:84ch;font-size:.97rem}
+.spec dt{font-family:var(--mono);font-size:.74rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding-top:.2rem}
+.spec dd{margin:0}
+.kv{display:inline-block;padding:.05em .5em;border-radius:3px;font-family:var(--mono);font-size:.8rem;font-weight:600}
+.kv.red{background:var(--red-soft);color:var(--red)}
+.kv.blue{background:var(--blue-soft);color:var(--blue)}
+.kv.amber{background:var(--amber-soft);color:var(--amber)}
+.legend{display:flex;flex-wrap:wrap;gap:.6rem 1.4rem;font-family:var(--mono);font-size:.78rem;color:var(--muted);margin-top:.5rem}
+.legend i{display:inline-block;width:22px;height:0;border-top:3px solid;vertical-align:middle;margin-right:.4rem}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}
+@media (max-width:720px){.two{grid-template-columns:1fr}.req{grid-template-columns:1fr}.req dt{padding-top:0}.spec{grid-template-columns:1fr}}
+a{color:var(--blue)}
+:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+@media (prefers-reduced-motion:no-preference){ .diagram svg .pulse{animation:pulse 2.4s ease-in-out infinite} }
+@keyframes pulse{0%,100%{opacity:.55}50%{opacity:1}}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">IntelMacAudioCpp · analysis and design · 16 September 2026</div>
+  <h1>Attention for the Vega II, designed from its requirements</h1>
+  <p class="thesis">At batch-1 decode the Vega II already runs attention faster than an M4 Max — 11.8 µs per context token against 13.3 — and loses only because it is refused the better algorithm. This is the specification of that algorithm, written for a 64-wide machine with a large register file and no matrix units, phase by phase.</p>
+  <div class="stamp">
+    <span>target <b>YuE2-3B · q8_0 · decode</b></span>
+    <span>machine <b>Radeon Pro Vega II · Vega 20 · GCN 5.1</b></span>
+    <span>measured floor <b>3.9 ms/token</b></span>
+    <span>measured now <b>80 ms/token @ 5,396</b></span>
+  </div>
+</header>
+
+<section>
+<h2>The curve we are chasing</h2>
+<div class="prose">
+<p>Everything in this document follows from one experiment. The M4 Max was run against itself with flash attention on and off while the context grew; the Vega II — which cannot run flash attention, because <code>FLASH_ATTN_EXT</code> is gated on <code>simdgroup_matrix</code> — was put on the same axes.</p>
+</div>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 760 340" role="img" aria-label="Per-token decode cost versus context length: M4 Max with flash attention is flat near 9.5 ms; M4 Max without it and the Vega II both rise linearly, the Vega II slightly shallower.">
+  <!-- grid -->
+  <g class="gr">
+    <line x1="60" y1="280" x2="700" y2="280"/><line x1="60" y1="228" x2="700" y2="228"/><line x1="60" y1="176" x2="700" y2="176"/><line x1="60" y1="124" x2="700" y2="124"/><line x1="60" y1="72" x2="700" y2="72"/><line x1="60" y1="20" x2="700" y2="20"/>
+  </g>
+  <g class="ax"><line x1="60" y1="20" x2="60" y2="280"/><line x1="60" y1="280" x2="700" y2="280"/></g>
+  <!-- y labels -->
+  <g class="lbl" text-anchor="end"><text x="52" y="284">0</text><text x="52" y="232">20</text><text x="52" y="180">40</text><text x="52" y="128">60</text><text x="52" y="76">80</text><text x="52" y="24">100</text></g>
+  <text class="lbl" x="14" y="150" transform="rotate(-90 14 150)" text-anchor="middle">ms per decoded token</text>
+  <!-- x labels -->
+  <g class="lbl" text-anchor="middle"><text x="80" y="298">200</text><text x="140" y="298">800</text><text x="220" y="298">1600</text><text x="380" y="298">3200</text><text x="700" y="298">6400</text></g>
+  <text class="lbl" x="380" y="322" text-anchor="middle">context length, tokens</text>
+  <!-- target line -->
+  <line x1="80" y1="242.1" x2="700" y2="242.1" stroke="var(--red)" stroke-width="2" stroke-dasharray="6 5" opacity=".55"/>
+  <text class="lbl" x="704" y="246" fill="var(--red)">target: Vega II flat at 14.6</text>
+  <!-- M4 FA off -->
+  <polyline fill="none" stroke="var(--blue)" stroke-width="2.5" points="80,249.7 100,242.4 140,229.7 220,203.0 380,147.2 700,35.4"/>
+  <g fill="var(--blue)"><circle cx="80" cy="249.7" r="3.5"/><circle cx="100" cy="242.4" r="3.5"/><circle cx="140" cy="229.7" r="3.5"/><circle cx="220" cy="203" r="3.5"/><circle cx="380" cy="147.2" r="3.5"/><circle cx="700" cy="35.4" r="3.5"/></g>
+  <text class="cap" x="560" y="80" fill="var(--blue)">M4 Max, FA off · 94.1 @ 6400</text>
+  <!-- Vega -->
+  <polyline fill="none" stroke="var(--red)" stroke-width="2.5" points="80,242.1 100,236.5 140,224.7 220,197.7 380,150.2"/>
+  <g fill="var(--red)"><circle cx="80" cy="242.1" r="3.5"/><circle cx="100" cy="236.5" r="3.5"/><circle cx="140" cy="224.7" r="3.5"/><circle cx="220" cy="197.7" r="3.5"/><circle cx="380" cy="150.2" r="3.5"/></g>
+  <text class="cap" x="392" y="140" fill="var(--red)">Vega II · 49.9 @ 3200</text>
+  <!-- M4 FA on -->
+  <polyline fill="none" stroke="var(--blue)" stroke-width="2.5" stroke-dasharray="2 3" points="80,255.9 100,256.3 140,255.4 220,255.2 380,253.8 700,255.1"/>
+  <g fill="var(--blue)"><circle cx="80" cy="255.9" r="3"/><circle cx="220" cy="255.2" r="3"/><circle cx="380" cy="253.8" r="3"/><circle cx="700" cy="255.1" r="3"/></g>
+  <text class="cap" x="520" y="272" fill="var(--blue)">M4 Max, FA on · flat ≈ 9.5</text>
+</svg>
+</div>
+<figcaption>Measured 16 Sep 2026, two repeats per point, <code>cot=off</code>, identical request. Slopes: M4 Max without FA <b>13.3 µs</b> per context token; Vega II <b>11.8 µs</b>. The Vega II line sits below the M4 Max line at 3,200. The dashed red line is the only speed claim this design makes: the Vega II's curve must go flat at its own intercept.</figcaption>
+</figure>
+<div class="prose">
+<p>What was eliminated on the way here, each by measurement rather than reasoning: bandwidth (80 ms/token against a 3.9 ms traffic floor — 69× off), host-side dispatch (<code>GGML_METAL_N_CB</code> 1→8 changes nothing; CPU 11% busy), and concurrent dispatch (3%, and disabled anyway for producing wrong results). What remains is occupancy: sixteen threadgroups of serial work on a card that wants two and a half thousand waves in flight.</p>
+</div>
+</section>
+
+<section>
+<h2>Requirements</h2>
+<div class="prose"><p>Each traces to a measurement or to the machine. R-numbers are referenced throughout; the phase specifications below cite them.</p></div>
+<dl class="req">
+  <dt>R1</dt><dd><b>Parallelism must come from the context dimension.</b> At batch 1 there are 16 heads of work (32 under CFG) for 64 CUs and ~2,560 wave slots. Heads and batch are exhausted; only the KV range is long. Split it into blocks; give each block its own workers; combine.</dd>
+  <dt>R2</dt><dd><b>Hide DRAM latency by wave switching, so keep each lane's live state small.</b> GCN covers memory latency with ready waves, not cache. Occupancy is set by VGPRs per lane. Attention at decode is traffic-shaped — 619 MB of KV per token against ~7 MFLOP — so it wants occupancy, not the register blocking that served the GEMM.</dd>
+  <dt>R3</dt><dd><b>Read every K and V row coalesced, once.</b> A row is head_dim 128 × f16 = 256 bytes. A wave64 instruction is 64 lanes. Whether a row is one clean access or 64 scattered ones is decided entirely by the lane→data mapping, which is therefore a requirement, not a detail.</dd>
+  <dt>R4</dt><dd><b>Exploit GQA 2:1.</b> <code>num_key_value_heads = 8</code> serve <code>num_attention_heads = 16</code>. Process both query heads of a KV head in the same threadgroup and K/V traffic halves: 619 → 310 MB per token at 8,000 context.</dd>
+  <dt>R5</dt><dd><b>Combine partials exactly with the online-softmax identity.</b> Blocks yield (m, l, o[128]); merging is <span class="mono">m = max(m₁,m₂); l = l₁e^(m₁−m) + l₂e^(m₂−m); o likewise</span>. Intrinsic to attention. Since dispatch cost is measured to be negligible here, a second reduce kernel is acceptable.</dd>
+  <dt>R6</dt><dd><b>fp32 accumulation; exp must not dominate.</b> ~3.6 M exponentials per token (8,000 × 16 heads × 28 layers). Even at quarter rate that is microseconds. Running max, sum and accumulators stay fp32.</dd>
+  <dt>R7</dt><dd><b>The oracle and the target already exist.</b> The explicit-attention path produces correct audio and is the per-tensor reference. The M4 Max FA-on curve is the target shape. Success is "flat", not a number chosen in advance.</dd>
+</dl>
+</section>
+
+<section>
+<h2>What the card offers, and which requirement each feature answers</h2>
+<div class="tbl">
+<table>
+<thead><tr><th>Feature of the Vega II</th><th>Answers</th><th>How</th></tr></thead>
+<tbody>
+<tr><td>64 CUs × 4 SIMDs × up to 10 waves</td><td class="n">R1</td><td>Slots for 1,000+ light work items — one wave per (head-pair, 64 keys)</td></tr>
+<tr><td><b>256 KB register file per CU</b></td><td class="n">R2</td><td>At 8 waves per SIMD each lane still owns 32 VGPRs; this design needs ~16. Occupancy with headroom</td></tr>
+<tr><td><b>64 KB LDS per CU</b>, conflict-free broadcast reads</td><td class="n">R3 R4 R5</td><td>Holds Q for both heads of a pair (1 KB), the block's probabilities (512 B), the intra-threadgroup partials (~2 KB)</td></tr>
+<tr><td>64-wide waves</td><td class="n">R3 R5</td><td>A wave reads a full 256 B row at 4 B per lane in one instruction; 64 keys is one wave with one key per lane — no tail logic inside a block</td></tr>
+<tr><td>647 GB/s measured triad, 4 MB L2</td><td class="n">R3</td><td>With ~1,000 waves in flight the KV read becomes bandwidth-shaped instead of latency-shaped; 310 MB is then ~0.5 ms</td></tr>
+<tr><td>Transcendental unit (quarter rate)</td><td class="n">R6</td><td>3.6 M exps ≈ 2 µs. No exp2 or polynomial tricks unless measured otherwise</td></tr>
+<tr><td><code>simd_max</code> / <code>simd_sum</code> / <code>simd_shuffle</code>, proven at 64 lanes today</td><td class="n">R5</td><td>The same reductions that took <code>GGML_OP_SUM</code> from 0/5 to 5/5 and pass 560 MUL_MAT shapes</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h2>Layer 0 — decomposition</h2>
+<div class="prose">
+<p>The grid is <b>(KV head, context block)</b>. Not query head: the two query heads that share a KV head ride in the same threadgroup (R4). A block is 256 keys; a threadgroup is 4 waves of 64 lanes — the same 256-thread shape as <code>kernel_mul_mm_w64</code>, already validated on this card — and each wave owns 64 keys, one per lane.</p>
+</div>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Decomposition: an 8 by 32 grid of KV heads by context blocks, one cell expanding to a threadgroup of 4 waves, one wave expanding to 64 lanes.">
+  <!-- grid of threadgroups -->
+  <text class="cap" x="20" y="24">grid: 8 KV heads × ⌈context / 256⌉ blocks</text>
+  <text class="lbl" x="20" y="40">at 8,000 context: 8 × 32 = 256 threadgroups</text>
+  <g id="tg-grid">
+    <!-- 8 rows x 16 cols drawn (abbreviated) -->
+    <g fill="var(--blue-soft)" stroke="var(--line)">
+      <rect x="20" y="60" width="256" height="128"/>
+    </g>
+    <g stroke="var(--line)" stroke-width="1">
+      <line x1="20" y1="76" x2="276" y2="76"/><line x1="20" y1="92" x2="276" y2="92"/><line x1="20" y1="108" x2="276" y2="108"/><line x1="20" y1="124" x2="276" y2="124"/><line x1="20" y1="140" x2="276" y2="140"/><line x1="20" y1="156" x2="276" y2="156"/><line x1="20" y1="172" x2="276" y2="172"/>
+      <line x1="36" y1="60" x2="36" y2="188"/><line x1="52" y1="60" x2="52" y2="188"/><line x1="68" y1="60" x2="68" y2="188"/><line x1="84" y1="60" x2="84" y2="188"/><line x1="100" y1="60" x2="100" y2="188"/><line x1="116" y1="60" x2="116" y2="188"/><line x1="132" y1="60" x2="132" y2="188"/><line x1="148" y1="60" x2="148" y2="188"/><line x1="164" y1="60" x2="164" y2="188"/><line x1="180" y1="60" x2="180" y2="188"/><line x1="196" y1="60" x2="196" y2="188"/><line x1="212" y1="60" x2="212" y2="188"/><line x1="228" y1="60" x2="228" y2="188"/><line x1="244" y1="60" x2="244" y2="188"/><line x1="260" y1="60" x2="260" y2="188"/>
+    </g>
+    <rect x="100" y="108" width="16" height="16" fill="var(--red)" class="pulse"/>
+    <text class="lbl" x="20" y="206">rows: KV head 0…7</text>
+    <text class="lbl" x="20" y="222">cols: keys 0–255, 256–511, … (…)</text>
+    <text class="lbl" x="20" y="238">each cell serves query heads 2h and 2h+1</text>
+  </g>
+  <!-- arrow -->
+  <path d="M290 116 L340 116" stroke="var(--muted)" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/></marker></defs>
+  <!-- threadgroup -->
+  <text class="cap" x="352" y="24">threadgroup: 256 threads = 4 waves</text>
+  <text class="lbl" x="352" y="40">256 keys of one KV head, both query heads</text>
+  <g>
+    <rect x="352" y="60" width="200" height="30" fill="var(--red-soft)" stroke="var(--red)"/><text x="360" y="79" font-size="12">wave 0 · keys   0– 63</text>
+    <rect x="352" y="94" width="200" height="30" fill="var(--surface)" stroke="var(--line)"/><text x="360" y="113" font-size="12">wave 1 · keys  64–127</text>
+    <rect x="352" y="128" width="200" height="30" fill="var(--surface)" stroke="var(--line)"/><text x="360" y="147" font-size="12">wave 2 · keys 128–191</text>
+    <rect x="352" y="162" width="200" height="30" fill="var(--surface)" stroke="var(--line)"/><text x="360" y="181" font-size="12">wave 3 · keys 192–255</text>
+    <rect x="352" y="200" width="200" height="22" fill="var(--amber-soft)" stroke="var(--amber)"/><text x="360" y="215" font-size="11">LDS · Q₀ Q₁ 1 KB · p 512 B · partials 2 KB</text>
+  </g>
+  <path d="M566 75 L616 75" stroke="var(--muted)" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <!-- wave -->
+  <text class="cap" x="628" y="24">wave: 64 lanes, one key each</text>
+  <text class="lbl" x="628" y="40">lane j ↔ key j (Phase A) · lane d ↔ dims 2d,2d+1 (Phase C)</text>
+  <g stroke="var(--line)" fill="var(--surface)">
+    <rect x="628" y="60" width="256" height="30"/>
+  </g>
+  <g stroke="var(--line)"><line x1="644" y1="60" x2="644" y2="90"/><line x1="660" y1="60" x2="660" y2="90"/><line x1="676" y1="60" x2="676" y2="90"/><line x1="692" y1="60" x2="692" y2="90"/><line x1="708" y1="60" x2="708" y2="90"/><line x1="724" y1="60" x2="724" y2="90"/><line x1="740" y1="60" x2="740" y2="90"/><line x1="756" y1="60" x2="756" y2="90"/><line x1="772" y1="60" x2="772" y2="90"/><line x1="788" y1="60" x2="788" y2="90"/><line x1="804" y1="60" x2="804" y2="90"/><line x1="820" y1="60" x2="820" y2="90"/><line x1="836" y1="60" x2="836" y2="90"/><line x1="852" y1="60" x2="852" y2="90"/><line x1="868" y1="60" x2="868" y2="90"/></g>
+  <rect x="628" y="60" width="16" height="30" fill="var(--red)"/>
+  <text class="lbl" x="628" y="106">0    1    2    3    …                                    63</text>
+  <text class="lbl" x="628" y="140">occupancy at 8,000 context:</text>
+  <text x="628" y="158" font-size="12">256 TGs × 4 = 1,024 waves</text>
+  <text x="628" y="176" font-size="12">~16 VGPRs/lane → 8 waves per SIMD schedulable</text>
+  <text x="628" y="194" font-size="12">machine capacity ≈ 2,048 at that footprint</text>
+  <text class="lbl" x="628" y="222">at 1,000 context: 32 TGs, 128 waves — under-filled,</text>
+  <text class="lbl" x="628" y="238">but that regime costs 15 ms/token today, not 80</text>
+</svg>
+</div>
+<figcaption>One threadgroup per (KV head, 256-key block). Its four waves split the block; each lane takes one key. Both query heads that share the KV head are computed by the same threadgroup, so every K and V row is fetched once and used twice.</figcaption>
+</figure>
+<dl class="spec">
+  <dt>grid</dt><dd><span class="mono">(8, ⌈ctx/256⌉, batch)</span> threadgroups. Batch is 1, or 2 under CFG (positive and negative prompts).</dd>
+  <dt>threadgroup</dt><dd>256 threads, 4 waves. <span class="mono">threadExecutionWidth = 64</span> is asserted by the probe on every pipeline already.</dd>
+  <dt>block</dt><dd>256 keys. Chosen so one wave = 64 keys = one key per lane, and four waves amortise one Q load and one partial write. Not a tuned constant — a structural one.</dd>
+  <dt>serves</dt><dd>query heads <span class="mono">2h</span> and <span class="mono">2h+1</span> of KV head <span class="mono">h</span>. Two independent accumulator sets per lane.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Phase A — scores · lane ↔ key</h2>
+<div class="prose">
+<p>The score for key <i>j</i> is a 128-long dot product with Q. There are two natural lane mappings and they are not equivalent on this hardware. Lane-per-dimension needs a 64-lane reduction per key — 6 shuffle steps each, 64 times per block. Lane-per-key needs none: every lane forms its own dot product and Q is a broadcast. This is the GEMV mapping an AMD programmer writes first; Apple's kernel cannot use it because <code>simdgroup_matrix</code> fixes the mapping for it.</p>
+</div>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 900 330" role="img" aria-label="Phase A: 64 lanes each stream one K row of 256 bytes left to right, multiplying against Q held in LDS as a broadcast, producing two score accumulators per lane.">
+  <!-- Q in LDS -->
+  <rect x="180" y="18" width="520" height="26" fill="var(--amber-soft)" stroke="var(--amber)"/>
+  <text x="188" y="35" font-size="12">LDS · Q₀[128], Q₁[128] as fp32 · read as broadcast, conflict-free · 1 KB</text>
+  <!-- broadcast arrows -->
+  <g stroke="var(--amber)" stroke-width="1" stroke-dasharray="3 3" fill="none">
+    <line x1="260" y1="44" x2="260" y2="70"/><line x1="440" y1="44" x2="440" y2="70"/><line x1="620" y1="44" x2="620" y2="70"/>
+  </g>
+  <!-- K block -->
+  <text class="cap" x="180" y="64">K block · 64 rows × 128 dims × f16 = 64 × 256 B</text>
+  <g fill="var(--surface)" stroke="var(--line)">
+    <rect x="180" y="70" width="520" height="200"/>
+  </g>
+  <!-- row lines (sample) -->
+  <g stroke="var(--grid)">
+    <line x1="180" y1="90" x2="700" y2="90"/><line x1="180" y1="110" x2="700" y2="110"/><line x1="180" y1="130" x2="700" y2="130"/><line x1="180" y1="150" x2="700" y2="150"/><line x1="180" y1="170" x2="700" y2="170"/><line x1="180" y1="190" x2="700" y2="190"/><line x1="180" y1="210" x2="700" y2="210"/><line x1="180" y1="230" x2="700" y2="230"/><line x1="180" y1="250" x2="700" y2="250"/>
+  </g>
+  <!-- highlighted lane row -->
+  <rect x="180" y="130" width="520" height="20" fill="var(--red-soft)"/>
+  <!-- 64B segments on that row -->
+  <g stroke="var(--red)" stroke-width="1" fill="none">
+    <rect x="180" y="130" width="130" height="20"/><rect x="310" y="130" width="130" height="20"/><rect x="440" y="130" width="130" height="20"/><rect x="570" y="130" width="130" height="20"/>
+  </g>
+  <text class="lbl" x="184" y="144" fill="var(--red)">64 B seg</text><text class="lbl" x="314" y="144" fill="var(--red)">64 B</text><text class="lbl" x="444" y="144" fill="var(--red)">64 B</text><text class="lbl" x="574" y="144" fill="var(--red)">64 B</text>
+  <!-- stream arrow along row -->
+  <path d="M186 160 L690 160" stroke="var(--red)" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+  <defs><marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--red)"/></marker></defs>
+  <text class="lbl" x="330" y="176" fill="var(--red)">lane 3 streams its own row: 128 FMAs × 2 heads, no cross-lane ops</text>
+  <!-- lanes on the left -->
+  <g font-size="11">
+    <text x="20" y="84" class="lbl">lane 0 → key 0</text>
+    <text x="20" y="104" class="lbl">lane 1 → key 1</text>
+    <text x="20" y="124" class="lbl">lane 2 → key 2</text>
+    <text x="20" y="144" fill="var(--red)" font-weight="600">lane 3 → key 3</text>
+    <text x="20" y="164" class="lbl">…</text>
+    <text x="20" y="264" class="lbl">lane 63 → key 63</text>
+  </g>
+  <!-- accumulators on the right -->
+  <g>
+    <rect x="720" y="122" width="160" height="36" fill="var(--red-soft)" stroke="var(--red)"/>
+    <text x="728" y="137" font-size="11">s₀[3] += K[3][d]·Q₀[d]</text>
+    <text x="728" y="151" font-size="11">s₁[3] += K[3][d]·Q₁[d]</text>
+    <text class="lbl" x="720" y="176">2 fp32 accumulators / lane</text>
+    <text class="lbl" x="720" y="192">Q read once per d, shared</text>
+    <text class="lbl" x="720" y="208">by both heads (R4)</text>
+  </g>
+  <!-- stride note -->
+  <text class="lbl" x="180" y="292">across lanes the rows are 256 B apart; each lane consumes its whole 64 B segment over the inner loop,</text>
+  <text class="lbl" x="180" y="308">so the 64 lanes' live segments total 4 KB — held in L1 across the loop. Plan B if it thrashes: stage K via LDS.</text>
+</svg>
+</div>
+<figcaption>Lane <i>j</i> owns key <i>j</i>. Q for both heads sits in LDS and is read as a broadcast, so the inner loop is pure independent FMA: 128 per head per lane, 256 per lane. Zero <code>simd_shuffle</code>. The row stride across lanes is absorbed by L1 because each lane drains its own 64-byte segments over the loop.</figcaption>
+</figure>
+<dl class="spec">
+  <dt>input</dt><dd><span class="mono">K[block]</span>: 64 rows × 128 × f16 per wave, from the KV cache at stride <span class="mono">nb_k</span> per key. <span class="mono">Q₀,Q₁</span>: staged once per threadgroup into LDS as fp32, RoPE already applied upstream.</dd>
+  <dt>lane state</dt><dd><span class="mono">s₀, s₁</span> fp32 accumulators; loop counter; one f16x2 load register. ~5 VGPRs live.</dd>
+  <dt>arithmetic</dt><dd>128 × 2 FMAs per lane. Loads: 128 halves per lane as 64 × 4-byte packed loads, converted to fp32 in-register.</dd>
+  <dt>cross-lane</dt><dd>None.</dd>
+  <dt>memory</dt><dd>Per lane 256 B contiguous. Per wave 16 KB per block (64 rows). L1 pressure: 64 live 64-B segments = 4 KB — well within a 16 KB L1. <b>This is the one assumption to measure first</b> (see Plan B).</dd>
+  <dt>tail</dt><dd>Lanes whose key index ≥ context set <span class="mono">s = −∞</span> and skip loads. Because a wave is exactly 64 keys, the tail is a single lane predicate, not a loop bound.</dd>
+  <dt>serves</dt><dd>R1, R3, R4.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Phase B — softmax · two wave reductions per block</h2>
+<div class="prose">
+<p>Each lane holds a raw score per head. Softmax needs the block maximum, then the exponentials, then their sum. On a 64-wide wave that is one <code>simd_max</code> and one <code>simd_sum</code> per head per block — six shuffle steps each — <b>once per 64 keys</b>, not once per key. That ratio is what makes Phase A's mapping pay: 256 FMAs of independent work per lane against 12 reduction steps.</p>
+</div>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 900 250" role="img" aria-label="Phase B: 64 per-lane scores reduce through 6 shuffle levels to a wave max, each lane exponentiates against it, the results reduce again to a wave sum, and probabilities are written to LDS.">
+  <!-- 64 scores strip -->
+  <text class="cap" x="20" y="22">s_j per lane (64)</text>
+  <g fill="var(--surface)" stroke="var(--line)"><rect x="20" y="30" width="256" height="22"/></g>
+  <rect x="20" y="30" width="4" height="22" fill="var(--red)"/><rect x="24" y="30" width="4" height="22" fill="var(--red)" opacity=".8"/><rect x="28" y="30" width="4" height="22" fill="var(--red)" opacity=".6"/>
+  <!-- reduction tree to max -->
+  <g stroke="var(--red)" stroke-width="1.2" fill="none">
+    <path d="M20 60 L148 60 L148 72"/><path d="M276 60 L148 60"/>
+    <path d="M84 78 L148 78"/><path d="M212 78 L148 78"/>
+    <path d="M116 88 L148 88"/><path d="M180 88 L148 88"/>
+    <line x1="148" y1="72" x2="148" y2="112"/>
+  </g>
+  <text class="lbl" x="160" y="76">shuffle_down 32</text>
+  <text class="lbl" x="160" y="86">16 · 8 · 4 · 2 · 1</text>
+  <text class="lbl" x="160" y="96">6 steps at 64 lanes</text>
+  <rect x="112" y="112" width="72" height="24" fill="var(--red-soft)" stroke="var(--red)"/>
+  <text x="120" y="128" font-size="12">m = simd_max</text>
+  <!-- exp -->
+  <path d="M296 41 L336 41" stroke="var(--muted)" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <text class="cap" x="350" y="22">p_j = exp(s_j − m)</text>
+  <g fill="var(--surface)" stroke="var(--line)"><rect x="350" y="30" width="256" height="22"/></g>
+  <text class="lbl" x="350" y="70">one exp per lane per head per block</text>
+  <text class="lbl" x="350" y="84">~3.6 M per token at 8,000 ctx · µs at quarter rate (R6)</text>
+  <!-- sum tree -->
+  <g stroke="var(--blue)" stroke-width="1.2" fill="none">
+    <path d="M350 98 L478 98 L478 110"/><path d="M606 98 L478 98"/>
+    <path d="M414 116 L478 116"/><path d="M542 116 L478 116"/>
+    <line x1="478" y1="110" x2="478" y2="140"/>
+  </g>
+  <rect x="436" y="140" width="84" height="24" fill="var(--blue-soft)" stroke="var(--blue)"/>
+  <text x="444" y="156" font-size="12">l = simd_sum(p)</text>
+  <!-- LDS write -->
+  <path d="M626 41 L666 41" stroke="var(--muted)" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <rect x="680" y="28" width="200" height="26" fill="var(--amber-soft)" stroke="var(--amber)"/>
+  <text x="688" y="45" font-size="12">LDS · p₀[64], p₁[64] · 512 B</text>
+  <text class="lbl" x="680" y="76">written by lane j at index j;</text>
+  <text class="lbl" x="680" y="90">read back as broadcast in Phase C</text>
+  <!-- running state -->
+  <text class="cap" x="20" y="190">running state per lane, per head (fp32):</text>
+  <text x="20" y="210" font-size="12">m_run, l_run, o_run[2 dims]  — first block: initialise; later blocks: rescale by exp(m_old − m_new) (R5)</text>
+  <text class="lbl" x="20" y="232">The rescale is one exp and four multiplies per lane per block. It is what lets a threadgroup's four waves each hold a running partial without ever seeing the others' keys.</text>
+</svg>
+</div>
+<figcaption>Two reductions per head per 64 keys. Probabilities land in LDS so that Phase C, which changes lane mapping, can read <i>p<sub>j</sub></i> uniformly. The running (m, l, o) triple is the online-softmax state; Phase B updates m and l, Phase C updates o.</figcaption>
+</figure>
+<dl class="spec">
+  <dt>cross-lane</dt><dd><span class="mono">simd_max</span> then <span class="mono">simd_sum</span>, per head: 4 reductions per block per lane. At 64 lanes each is 6 shuffle steps — one more than at 32. The concrete, bounded cost of wave64.</dd>
+  <dt>numerics</dt><dd>fp32 throughout. <span class="mono">exp(s − m)</span> with m the block max keeps every argument ≤ 0; no overflow path exists. Masked keys carry <span class="mono">s = −∞ → p = 0</span> and contribute nothing to l.</dd>
+  <dt>rescale</dt><dd>Wave-local running state across the wave's own blocks within a threadgroup is not needed — each wave handles exactly one 64-key block per threadgroup. Rescaling happens once, at the intra-threadgroup merge (Layer 4). This keeps Phase B stateless within a wave.</dd>
+  <dt>LDS</dt><dd>512 B per threadgroup for p; written at lane index, read broadcast. Bank-conflict free in both directions on 32-bank LDS with 4-byte entries.</dd>
+  <dt>serves</dt><dd>R5, R6.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Phase C — output · lane ↔ dim</h2>
+<div class="prose">
+<p>The output for a block is <i>o[d] = Σ<sub>j</sub> p<sub>j</sub> V[j][d]</i>. Keeping lane-per-key here would need a 64-lane reduction for every one of 128 output dimensions. So the mapping flips: lane <i>d</i> owns dims 2<i>d</i>, 2<i>d</i>+1 and loops over the 64 keys, reading <i>p<sub>j</sub></i> as an LDS broadcast and V[<i>j</i>] as one coalesced 256-byte row across the wave. Two mappings in one kernel — each phase gets the one that makes its memory access clean and its arithmetic shuffle-free.</p>
+</div>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 900 320" role="img" aria-label="Phase C: lanes are laid across the 128 head dimensions, two per lane; the wave walks down 64 V rows, each row read coalesced across all lanes, with the probability for that row broadcast from LDS.">
+  <!-- lanes across the top -->
+  <text class="cap" x="180" y="22">lanes across the head dimension · lane d ↔ dims 2d, 2d+1</text>
+  <g fill="var(--surface)" stroke="var(--line)"><rect x="180" y="30" width="520" height="22"/></g>
+  <g stroke="var(--line)"><line x1="212" y1="30" x2="212" y2="52"/><line x1="244" y1="30" x2="244" y2="52"/><line x1="276" y1="30" x2="276" y2="52"/><line x1="308" y1="30" x2="308" y2="52"/><line x1="340" y1="30" x2="340" y2="52"/><line x1="372" y1="30" x2="372" y2="52"/><line x1="404" y1="30" x2="404" y2="52"/><line x1="436" y1="30" x2="436" y2="52"/><line x1="468" y1="30" x2="468" y2="52"/><line x1="500" y1="30" x2="500" y2="52"/><line x1="532" y1="30" x2="532" y2="52"/><line x1="564" y1="30" x2="564" y2="52"/><line x1="596" y1="30" x2="596" y2="52"/><line x1="628" y1="30" x2="628" y2="52"/><line x1="660" y1="30" x2="660" y2="52"/></g>
+  <rect x="276" y="30" width="32" height="22" fill="var(--red)"/>
+  <text class="lbl" x="180" y="66">lane 0      1       2      3  …                                                          63</text>
+  <!-- V block -->
+  <text class="cap" x="180" y="92">V block · 64 rows × 128 dims × f16</text>
+  <g fill="var(--surface)" stroke="var(--line)"><rect x="180" y="98" width="520" height="180"/></g>
+  <g stroke="var(--grid)"><line x1="180" y1="118" x2="700" y2="118"/><line x1="180" y1="138" x2="700" y2="138"/><line x1="180" y1="158" x2="700" y2="158"/><line x1="180" y1="178" x2="700" y2="178"/><line x1="180" y1="198" x2="700" y2="198"/><line x1="180" y1="218" x2="700" y2="218"/><line x1="180" y1="238" x2="700" y2="238"/><line x1="180" y1="258" x2="700" y2="258"/></g>
+  <!-- one coalesced row -->
+  <rect x="180" y="138" width="520" height="20" fill="var(--blue-soft)"/>
+  <rect x="276" y="138" width="32" height="20" fill="var(--red)" opacity=".7"/>
+  <text class="lbl" x="184" y="152" fill="var(--blue)">row j = 2 · one 256 B access, 4 B per lane, coalesced</text>
+  <!-- column stream for highlighted lane -->
+  <path d="M292 104 L292 268" stroke="var(--red)" stroke-width="2" fill="none" marker-end="url(#ar2)"/>
+  <!-- p from LDS on the left -->
+  <rect x="20" y="98" width="140" height="180" fill="var(--amber-soft)" stroke="var(--amber)"/>
+  <text x="28" y="116" font-size="12">LDS · p_j</text>
+  <text class="lbl" x="28" y="132">p_0</text><text class="lbl" x="28" y="152" fill="var(--amber)" font-weight="600">p_2  → broadcast</text><text class="lbl" x="28" y="172">p_3</text><text class="lbl" x="28" y="192">…</text><text class="lbl" x="28" y="264">p_63</text>
+  <path d="M160 148 L176 148" stroke="var(--amber)" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+  <!-- accumulators right -->
+  <rect x="720" y="128" width="160" height="52" fill="var(--red-soft)" stroke="var(--red)"/>
+  <text x="728" y="144" font-size="11">o₀[2d..] += p₀[j]·V[j][2d..]</text>
+  <text x="728" y="158" font-size="11">o₁[2d..] += p₁[j]·V[j][2d..]</text>
+  <text x="728" y="172" font-size="11">4 fp32 accumulators / lane</text>
+  <text class="lbl" x="720" y="200">64 iterations · 4 FMAs each</text>
+  <text class="lbl" x="720" y="216">V row fetched once, used</text>
+  <text class="lbl" x="720" y="232">by both heads (R4)</text>
+  <text class="lbl" x="180" y="300">no cross-lane operations; V traffic per wave 16 KB per block, every access a full-width coalesced row</text>
+</svg>
+</div>
+<figcaption>Lane <i>d</i> walks down the block's 64 V rows accumulating its two output dims for each head. Every V access is a 256-byte row spread across the wave — the coalescing ideal. <i>p<sub>j</sub></i> arrives as an LDS broadcast so no lane needs another lane's register.</figcaption>
+</figure>
+<dl class="spec">
+  <dt>lane state</dt><dd><span class="mono">o₀[2], o₁[2]</span> fp32; loop counter; one f16x2 load. ~6 VGPRs.</dd>
+  <dt>arithmetic</dt><dd>64 keys × 2 dims × 2 heads = 256 FMAs per lane. Same count as Phase A; the kernel is balanced across its two GEMVs.</dd>
+  <dt>cross-lane</dt><dd>None. <span class="mono">p_j</span> is a broadcast LDS read (all lanes same address → single bank, no conflict).</dd>
+  <dt>memory</dt><dd>Per row 256 B across 64 lanes at 4 B each: exactly the wave64 coalescing unit. 64 rows per block.</dd>
+  <dt>tail</dt><dd>Masked keys have <span class="mono">p = 0</span> from Phase B; their V rows may still be loaded (harmless, in-bounds within the cache allocation) or skipped by a uniform branch on the block's valid count. Skip: it saves traffic on the last block only.</dd>
+  <dt>serves</dt><dd>R1, R3, R4.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Layer 4 — combining partials</h2>
+<div class="prose">
+<p>After Phases A–C each wave holds, per head, a partial (m, l, o[128]) for its 64 keys. Two merges follow: four waves into one partial per threadgroup, through LDS; then all threadgroups of a head into the final output, in a second kernel. Both use the same identity (R5). The second kernel is trivially small, and dispatch cost is measured to be a non-issue here, so the main kernel stays simple.</p>
+</div>
+<figure>
+<div class="diagram">
+<svg viewBox="0 0 900 300" role="img" aria-label="Combining: four wave partials merge in LDS into one threadgroup partial, which is written to a scratch buffer indexed by head and block; a reduce kernel with one threadgroup per head merges the blocks and normalises.">
+  <!-- wave partials -->
+  <text class="cap" x="20" y="22">in-threadgroup · LDS</text>
+  <g font-size="11">
+    <rect x="20" y="34" width="150" height="24" fill="var(--red-soft)" stroke="var(--red)"/><text x="28" y="50">wave 0 · (m,l,o[128])</text>
+    <rect x="20" y="64" width="150" height="24" fill="var(--surface)" stroke="var(--line)"/><text x="28" y="80">wave 1 · (m,l,o[128])</text>
+    <rect x="20" y="94" width="150" height="24" fill="var(--surface)" stroke="var(--line)"/><text x="28" y="110">wave 2 · (m,l,o[128])</text>
+    <rect x="20" y="124" width="150" height="24" fill="var(--surface)" stroke="var(--line)"/><text x="28" y="140">wave 3 · (m,l,o[128])</text>
+  </g>
+  <g stroke="var(--muted)" stroke-width="1.2" fill="none">
+    <path d="M170 46 L200 46 L200 91"/><path d="M170 76 L200 76"/><path d="M170 106 L200 106"/><path d="M170 136 L200 136 L200 91"/>
+    <path d="M200 91 L232 91" marker-end="url(#ar)"/>
+  </g>
+  <rect x="240" y="72" width="170" height="38" fill="var(--amber-soft)" stroke="var(--amber)"/>
+  <text x="248" y="88" font-size="11">m = max(m₀..m₃)</text>
+  <text x="248" y="102" font-size="11">l, o rescaled by e^(mᵢ−m), summed</text>
+  <text class="lbl" x="240" y="128">wave 0 does it: 3 exps, 3×130 FMAs,</text>
+  <text class="lbl" x="240" y="142">one barrier. ~2 KB LDS for the four partials.</text>
+  <!-- scratch -->
+  <path d="M420 91 L456 91" stroke="var(--muted)" stroke-width="1.2" fill="none" marker-end="url(#ar)"/>
+  <text class="cap" x="466" y="22">scratch buffer · device memory</text>
+  <g fill="var(--blue-soft)" stroke="var(--blue)"><rect x="466" y="34" width="180" height="120"/></g>
+  <g stroke="var(--line)"><line x1="466" y1="54" x2="646" y2="54"/><line x1="466" y1="74" x2="646" y2="74"/><line x1="466" y1="94" x2="646" y2="94"/><line x1="466" y1="114" x2="646" y2="114"/><line x1="466" y1="134" x2="646" y2="134"/></g>
+  <rect x="466" y="74" width="180" height="20" fill="var(--red)" opacity=".5"/>
+  <text x="472" y="48" font-size="11">[head 0][block 0..31]</text>
+  <text x="472" y="88" font-size="11">[head 2][block 0..31]  ← this TG</text>
+  <text x="472" y="148" font-size="11">[head 15][block 0..31]</text>
+  <text class="lbl" x="466" y="172">16 × 32 × 130 fp32 ≈ 1.06 MB at 8,000 ctx</text>
+  <text class="lbl" x="466" y="186">(m, l, o[128]) per entry · written once, read once</text>
+  <!-- reduce kernel -->
+  <path d="M656 94 L692 94" stroke="var(--muted)" stroke-width="1.2" fill="none" marker-end="url(#ar)"/>
+  <text class="cap" x="700" y="22">reduce kernel</text>
+  <rect x="700" y="34" width="180" height="120" fill="var(--surface)" stroke="var(--line)"/>
+  <text x="708" y="52" font-size="11">grid: 16 heads × batch</text>
+  <text x="708" y="68" font-size="11">TG: one wave, 64 lanes</text>
+  <text x="708" y="88" font-size="11">lane k merges blocks</text>
+  <text x="708" y="102" font-size="11">k, k+64, … (R5 identity)</text>
+  <text x="708" y="122" font-size="11">simd_max / simd_sum across</text>
+  <text x="708" y="136" font-size="11">lanes → o / l → out[head][128]</text>
+  <text class="lbl" x="700" y="172">≈ 32 partials per head: a few µs</text>
+  <text class="lbl" x="700" y="186">total. Dispatch cost measured ≈ 0.</text>
+  <!-- result -->
+  <text class="cap" x="20" y="224">result</text>
+  <rect x="20" y="234" width="860" height="26" fill="var(--surface)" stroke="var(--line)"/>
+  <text x="28" y="251" font-size="12">out[batch][16 heads][128] fp32, normalised · identical contract to the explicit path's output tensor · feeds o_proj unchanged</text>
+  <text class="lbl" x="20" y="286">Precision: every merge is fp32; e^(mᵢ−m) ≤ 1 by construction, so nothing grows. This is the standard flash-decoding combine and it is exact up to fp32 rounding.</text>
+</svg>
+</div>
+<figcaption>Two-level combine. Inside a threadgroup, wave 0 merges four partials through LDS. Across threadgroups, a reduce kernel with one wave per head merges ~32 partials and normalises. The scratch buffer is written once and read once; at 8,000 context it is about a megabyte.</figcaption>
+</figure>
+<dl class="spec">
+  <dt>intra-TG merge</dt><dd>Barrier; waves 1–3 write (m, l, o[128]) to LDS; wave 0 merges with the R5 identity into its own registers (lane d owns dims 2d, 2d+1 — the Phase C mapping, so no re-layout); wave 0 writes the threadgroup partial. 2,080 B of LDS.</dd>
+  <dt>scratch</dt><dd><span class="mono">partials[batch][16][nblocks][130]</span> fp32, allocated by the host per graph at <span class="mono">nblocks = ⌈ctx/256⌉</span>. Same lifetime as any ggml intermediate.</dd>
+  <dt>reduce kernel</dt><dd>Grid <span class="mono">(16, batch)</span>, one wave. Lane k folds partials <span class="mono">k, k+64, …</span> serially with the identity, then two wave reductions fold 64 lanes to one: <span class="mono">m</span> via <span class="mono">simd_max</span>, then rescaled <span class="mono">l</span> and <span class="mono">o</span> via <span class="mono">simd_sum</span> — o needs 128 sums, done as each lane owning two dims after a shuffle transpose through LDS. Normalise, write. Sub-millisecond in every case.</dd>
+  <dt>serves</dt><dd>R5, R7 (its output is bit-comparable to the explicit path).</dd>
+</dl>
+</section>
+
+<section>
+<h2>Layer 5 — host integration</h2>
+<div class="prose">
+<p>The kernel is selected, not substituted. ggml's <code>FLASH_ATTN_EXT</code> op already carries Q, K, V, an optional mask and a scale; the host's job is to route decode-shaped instances of that op to this kernel on a wave64 device and leave everything else exactly as it is.</p>
+</div>
+<dl class="spec">
+  <dt>capability</dt><dd><span class="mono">supports_op(FLASH_ATTN_EXT)</span> currently returns <span class="mono">has_simdgroup_mm</span>. It becomes <span class="mono">has_simdgroup_mm || (has_mm_w64 &amp;&amp; decode_shaped(op))</span>, where decode-shaped is <span class="mono">n_queries ≤ 2</span>, head_dim 128, K/V f16, and KV rows contiguous per head. Anything else on a wave64 device keeps returning false and falls back as today.</dd>
+  <dt>gate placement</dt><dd>This makes <span class="mono">AUDIOCPP_DISABLE_FLASH_ATTN</span> unnecessary for decode on AMD but still required for prefill, since the prefill kernels remain unported. The cleaner end state is for audio.cpp to consult <span class="mono">supports_op</span> per call rather than a process-wide switch; that is a small change in <span class="mono">qwen_decoder.cpp</span> and <span class="mono">nar_runtime.cpp</span> and is out of scope for the kernel itself.</dd>
+  <dt>dispatch</dt><dd>Two encodes per attention op: main kernel at grid <span class="mono">(8, ⌈ctx/256⌉, batch)</span> × 256 threads with LDS = 1 KB + 512 B + 2,080 B; reduce at <span class="mono">(16, batch)</span> × 64 threads. Scratch buffer from the graph allocator.</dd>
+  <dt>dials</dt><dd><span class="mono">GGML_METAL_FA_W64_DISABLE</span> — the A/B dial, value-aware like <span class="mono">MM_W64_DISABLE</span>. Nothing else. The block size is structural and is not exposed.</dd>
+  <dt>apple silicon</dt><dd>Unreachable: <span class="mono">has_mm_w64</span> is false there. The parity check (AIR at width 32, function-by-function) is rerun before commit as it was for the GEMM.</dd>
+</dl>
+</section>
+
+<section>
+<h2>Budgets</h2>
+<div class="two">
+<div class="tbl">
+<table>
+<thead><tr><th>Per lane, live VGPRs</th><th>count</th></tr></thead>
+<tbody>
+<tr><td>Phase A: s₀, s₁, loop, load</td><td class="n">≈ 5</td></tr>
+<tr><td>Phase B: m, l per head, p, temps</td><td class="n">≈ 6</td></tr>
+<tr><td>Phase C: o₀[2], o₁[2], loop, load</td><td class="n">≈ 6</td></tr>
+<tr><td>addressing, predicates, scale</td><td class="n">≈ 6</td></tr>
+<tr><td><b>peak estimate</b></td><td class="n"><b>≈ 16–24</b></td></tr>
+<tr><td>waves/SIMD at that footprint</td><td class="n">8–10</td></tr>
+</tbody>
+</table>
+</div>
+<div class="tbl">
+<table>
+<thead><tr><th>Per threadgroup, LDS</th><th>bytes</th></tr></thead>
+<tbody>
+<tr><td>Q₀, Q₁ as fp32</td><td class="n">1,024</td></tr>
+<tr><td>p₀, p₁ (64 each)</td><td class="n">512</td></tr>
+<tr><td>3 wave partials × 130 fp32</td><td class="n">1,560</td></tr>
+<tr><td><b>total</b></td><td class="n"><b>3,096</b></td></tr>
+<tr><td>TGs per CU by LDS (64 KB)</td><td class="n">21</td></tr>
+<tr><td>TGs per CU by waves (40 / 4)</td><td class="n">10 → waves bind</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+<div class="tbl">
+<table>
+<thead><tr><th>Traffic per decoded token, per layer, at 8,000 context</th><th>explicit path today</th><th>this design</th></tr></thead>
+<tbody>
+<tr><td>K read</td><td class="n">8,000 × 8 heads × 256 B × 2 (per q head) = 32.8 MB</td><td class="n">16.4 MB — once per KV head (R4)</td></tr>
+<tr><td>V read</td><td class="n">32.8 MB</td><td class="n">16.4 MB</td></tr>
+<tr><td>score matrix write + read</td><td class="n">≥ 2 × 16 × 8,000 × 4 B = 1.0 MB, plus softmax passes</td><td class="n">0 — never materialised</td></tr>
+<tr><td>partials</td><td class="n">—</td><td class="n">33 KB write + read</td></tr>
+<tr><td><b>× 28 layers</b></td><td class="n"><b>≈ 1.9 GB</b></td><td class="n"><b>≈ 0.92 GB → 1.4 ms at 647 GB/s</b></td></tr>
+</tbody>
+</table>
+</div>
+<div class="prose"><p>Traffic halves, but that was never the problem — the explicit path's 1.9 GB is only 2.9 ms of bandwidth and it spends 66 ms. What this design changes is that the 0.92 GB is read by a thousand waves instead of sixteen threadgroups, so the card is finally bandwidth-shaped rather than latency-shaped. That is the whole argument, and it is the thing the flat curve will confirm or deny.</p></div>
+</section>
+
+<section>
+<h2>What is genuinely harder here</h2>
+<div class="prose">
+<div class="note">
+<p><b>Phase A's row stride is the one assumption the design rests on.</b> Sixty-four lanes reading rows 256 bytes apart is uncoalesced at the instruction level; it works only if L1 holds the 64 live 64-byte segments across the inner loop. On paper that is 4 KB in a 16 KB L1. If measurement shows it thrashing — visible as Phase A running far below the bandwidth its traffic implies — <b>Plan B</b> is to stage the K block through LDS with a Phase-C-style coalesced load and a transpose: 16 KB per block, one extra barrier, still well inside the 64 KB LDS. The rest of the design is unchanged.</p>
+</div>
+<p>Two smaller costs, stated so they are not discovered later: every wave reduction is 6 shuffle steps rather than 5, and a kernel with two lane mappings is two mental models to get right rather than one. The second is also the source of most of the win.</p>
+<p>What is <i>not</i> harder: nothing here needs <code>simdgroup_matrix</code>, and nothing here needs a threadgroup size that is a multiple of 32 for its own sake. Those were consequences of Apple's design, not of attention.</p>
+</div>
+</section>
+
+<section>
+<h2>Validation gates, in order</h2>
+<div class="prose">
+<dl class="req">
+  <dt>gate 1</dt><dd><b>Op-level.</b> <code>test-backend-ops -o FLASH_ATTN_EXT</code> at the real shapes (head_dim 128, n_q 1–2, ctx 64…8,192), one op under the 30 s watchdog, against the CPU reference. NMSE below the op's tolerance — a number, not an impression.</dd>
+  <dt>gate 2</dt><dd><b>Per-tensor A/B on the card.</b> New kernel against the explicit path on identical inputs, via <code>GGML_METAL_FA_W64_DISABLE</code>. Max abs and NMSE per layer. This catches what the synthetic shapes miss.</dd>
+  <dt>gate 3</dt><dd><b>The curve.</b> ms/token at 200 / 800 / 1,600 / 3,200 / 6,400, two repeats. It must go flat — the dashed red line in the first figure. Phase A's stride assumption lives or dies here: a flat curve that sits far above the intercept means Plan B.</dd>
+  <dt>gate 4</dt><dd><b>The oracle.</b> Waveform check — peak, full-scale count, level count — then the full song, then the headphones. In that order, as always. No timing number is quoted before gate 4 passes.</dd>
+</dl>
+</div>
+</section>
+
+<footer style="margin-top:4rem;padding-top:1rem;border-top:1px solid var(--line);font-size:.85rem;color:var(--muted)">
+<div class="eyebrow">sources</div>
+<p>Measurements: <span class="mono">bench/VEGA-II.md</span>, <span class="mono">fa-sweep/</span> in <span class="mono">/Volumes/xb/music</span>. Model: <span class="mono">yue2-model-config.json</span> — hidden 2048, 28 layers, 16 heads, 8 KV heads, head_dim 128. Card: the user's oracles at <span class="mono">/Volumes/S/oracles</span> — 647 GB/s triad, 830 GB/s copy, 13.1 TFLOP/s FMA. Fork: <a href="https://github.com/albanread/IntelMacAudioCpp">albanread/IntelMacAudioCpp</a>.</p>
+</footer>
+</div>
+
+</body>
+</html>
