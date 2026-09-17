@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-ops.h" // ggml_metal_op_flash_attn_ext_use_vec_w64
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -903,6 +904,35 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 }
             }
 
+            // wave64 devices also get their own flash-attention vec kernels
+            // (kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 in ggml-metal.metal), which are
+            // only compiled into the library when N_SIMDWIDTH == 64. same necessary conditions
+            // as the GEMM: the raw probe must have said 64 so a failed probe's 32-lane fallback
+            // can never arm a 64-lane kernel, and the compiled width must agree.
+            //
+            // this prop says "the kernels exist". whether a given node can use them is a
+            // per-node shape question - see ggml_metal_op_flash_attn_ext_use_vec_w64().
+            dev->props.has_fa_vec_w64 =
+                !dev->props.has_simdgroup_mm &&
+                dev->simd_width_probed == 64 &&
+                dev->props.simd_width  == 64;
+            // value-aware, like GGML_METAL_MM_W64_DISABLE and unlike a bare presence test:
+            // FA_W64_DISABLE=0 silently inverting an A/B is exactly the failure this avoids.
+            // "", "0", "false", "no", "off" all mean off.
+            {
+                const char * s = getenv("GGML_METAL_FA_W64_DISABLE");
+                if (s && !(s[0] == 0 ||
+                           strcmp(s, "0") == 0 ||
+                           strcasecmp(s, "false") == 0 ||
+                           strcasecmp(s, "no") == 0 ||
+                           strcasecmp(s, "off") == 0)) {
+                    if (dev->props.has_fa_vec_w64) {
+                        GGML_LOG_INFO("%s: GGML_METAL_FA_W64_DISABLE=%s - wave64 flash-attention off, FLASH_ATTN_EXT falls back to another backend\n", __func__, s);
+                    }
+                    dev->props.has_fa_vec_w64 = false;
+                }
+            }
+
             // mat-vec -> mat-mul crossover. 8 and 32 are the upstream defaults, tuned on Apple
             // GPUs; on this card the fork measured batching only becoming cheap above ~32, so
             // these want sweeping per device rather than inheriting.
@@ -1121,6 +1151,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
             GGML_LOG_INFO("%s: simd group width      = %d\n", __func__, dev->props.simd_width);
             GGML_LOG_INFO("%s: wave64 mat-mul        = %s\n", __func__, dev->props.has_mm_w64             ? "true" : "false");
+            GGML_LOG_INFO("%s: wave64 flash attn     = %s\n", __func__, dev->props.has_fa_vec_w64         ? "true" : "false");
             GGML_LOG_INFO("%s: mat-mul min batch     = %d (id: %d)\n", __func__, dev->props.mm_min, dev->props.mm_id_min);
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
@@ -1307,6 +1338,7 @@ static bool ggml_metal_type_supported_at_simd_width(ggml_metal_device_t dev, enu
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
+    const bool has_fa_vec_w64          = dev->props.has_fa_vec_w64;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
     const int  simd_width              = dev->props.simd_width;
@@ -1506,7 +1538,20 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 default:
                     return false;
             }
-            return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+            if (has_simdgroup_mm) {
+                return true;
+            }
+
+            // wave64 devices have no simdgroup_matrix, so kernel_flash_attn_ext_impl and
+            // kernel_flash_attn_ext_blk stay out of reach and prefill-shaped nodes keep
+            // answering no. the decode-shaped vec nodes do have a wave64 kernel
+            // (kernel_flash_attn_ext_vec_w64), so admit exactly the shapes it is instantiated
+            // for - by the same predicate ggml_metal_op_flash_attn_ext() uses to select it,
+            // so the two can never disagree.
+            //
+            // Apple silicon never reaches this line: has_simdgroup_mm is true there and
+            // has_fa_vec_w64 requires it to be false.
+            return has_fa_vec_w64 && ggml_metal_op_flash_attn_ext_use_vec_w64(op);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;

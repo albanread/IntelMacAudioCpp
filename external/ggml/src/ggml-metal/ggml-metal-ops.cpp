@@ -2787,6 +2787,36 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     return (ne01 < 20) && (ne00 % 32 == 0);
 }
 
+bool ggml_metal_op_flash_attn_ext_use_vec_w64(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
+        return false;
+    }
+
+    // only the instantiations that sit next to kernel_flash_attn_ext_vec_w64 in
+    // ggml-metal.metal. adding a head size here without adding the template instantiation
+    // would look up a pipeline that does not exist; adding one there without re-checking
+    // DK4 % NL and DV4 % NL would compile and be wrong.
+    if (op->src[1]->ne[0] != 128 || op->src[2]->ne[0] != 128) {
+        return false;
+    }
+
+    if (op->src[1]->type != op->src[2]->type) {
+        return false;
+    }
+
+    switch (op->src[1]->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+            break;
+        default:
+            return false;
+    }
+
+    return true;
+}
+
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -2977,6 +3007,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
+        //
+        // this one uses simdgroup_matrix and assumes 32-lane waves. it is reachable only
+        // because ggml_metal_device_supports_op() requires has_simdgroup_mm for any node that
+        // is not decode-shaped, and no wave64 device reports it. assert rather than trust it.
+        GGML_ASSERT(GGML_METAL_NW == 32 &&
+                "flash-attention non-vec node reached a wave64 device, which has no wave64 kernel for it");
+
         const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG; // cache values per simdgroup
 
@@ -3144,13 +3181,25 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 #undef FATTN_SMEM
     } else {
         // half4x4 kernel
+        //
+        // on a wave64 device the 32-lane vec kernel is not merely slow, it is wrong: it indexes
+        // its C-entry score array with a lane id. the wave64 instantiation is selected instead
+        // and C follows the wave width. see kernel_flash_attn_ext_vec_w64 in ggml-metal.metal.
+        const bool use_w64 = props_dev->has_fa_vec_w64 && ggml_metal_op_flash_attn_ext_use_vec_w64(op);
+
+        const int nw = use_w64 ? GGML_METAL_NW : 32;   // lanes per simdgroup
+
         const int nqptg = OP_FLASH_ATTN_EXT_VEC_NQPSG; // queries per threadgroup
-        const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
+        const int ncpsg = use_w64 ? OP_FLASH_ATTN_EXT_VEC_W64_NCPSG  // cache values per simdgroup
+                                  : OP_FLASH_ATTN_EXT_VEC_NCPSG;     // !! sync with kernel template arguments !!
         const int nhptg = 1;                           // heads per threadgroup
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg  % 1  == 0);
         GGML_ASSERT(ncpsg  % 32 == 0);
+        GGML_ASSERT(ncpsg == nw && "the vec kernels index a C-entry score array with a lane id, so C must equal the wave width");
+        GGML_ASSERT((use_w64 || GGML_METAL_NW == 32) &&
+                "flash-attention vec node reached a wave64 device with no matching wave64 instantiation");
 
         bool need_sync = false;
 
@@ -3189,7 +3238,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             assert(ne12 == ne22);
             assert(ne13 == ne23);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, ncpsg, std::max(ne12, ne32), std::max(ne13, ne33), 32, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ncpsg, std::max(ne12, ne32), std::max(ne13, ne33), nw, 1, 1);
 
             need_sync = true;
         }
@@ -3263,9 +3312,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, use_w64);
 
-        GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        GGML_ASSERT(nsg*nw <= (int64_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3289,7 +3338,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            // grid order is load-bearing: Metal varies x fastest, so with ne01 == 1 the query
+            // heads (y) are adjacent over the same KV range and the KV split sits in z. that
+            // keeps all the KV heads of a key range co-resident. do not reorder.
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, nw, nsg, 1);
         } else {
             // sanity checks
             assert(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
@@ -3302,7 +3354,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, bid_tmp, 7);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
+            // grid order is load-bearing: Metal varies x fastest, so with ne01 == 1 the query
+            // heads (y) are adjacent over the same KV range and the KV split sits in z. that
+            // keeps all the KV heads of a key range co-resident. do not reorder.
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, nw, nsg, 1);
 
             // sync the 2 kernels
             ggml_metal_op_concurrency_reset(ctx);
@@ -3315,14 +3370,27 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                     nrows,
                 };
 
-                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg, use_w64);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
 
-                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+                // both reduce kernels put one lane on each of the nwg partials of a row, so
+                // nwg must fit in a simdgroup. the 32-lane kernel additionally wants exactly
+                // nwg simdgroups (its output loop strides by nwg); the wave64 one takes the
+                // simdgroup count from the dispatched threadgroup size, which it has to,
+                // because nw*nwg would be 2048 threads against Metal's 1024 limit.
+                GGML_ASSERT(nwg <= nw);
+
+                const int64_t nsg_red = use_w64
+                    ? std::max<int64_t>(1, std::min<int64_t>(nwg, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline0)/nw))
+                    : nwg;
+
+                GGML_ASSERT(nsg_red*nw <= (int64_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline0));
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nsg_red*nw, 1, 1);
             }
         }
 #undef FATTN_SMEM

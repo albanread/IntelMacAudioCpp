@@ -1641,7 +1641,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    has_scap,
         bool    has_kvpad,
         int32_t nsg,
-        int32_t nwg) {
+        int32_t nwg,
+        bool    w64) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1654,7 +1655,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext_vec",
+            w64 ? "flash_attn_ext_vec_w64" : "flash_attn_ext_vec",
             ggml_type_name(op->src[1]->type),
             dk,
             dv);
@@ -1697,13 +1698,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_library_t lib,
         const ggml_tensor * op,
         int32_t dv,
-        int32_t nwg) {
+        int32_t nwg,
+        bool    w64) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_flash_attn_ext_vec_reduce");
+    snprintf(base, 256, "%s", w64 ? "kernel_flash_attn_ext_vec_reduce_w64" : "kernel_flash_attn_ext_vec_reduce");
     snprintf(name, 256, "%s_dv=%d_nwg=%d", base, dv, nwg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

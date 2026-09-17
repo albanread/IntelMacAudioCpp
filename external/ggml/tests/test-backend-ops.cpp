@@ -6419,9 +6419,14 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    // the K/V cache view a decode graph passes has exactly nh head slots. the default here
+    // allocates twice that and views half of it, which doubles the key row stride, so the
+    // stride a real cache presents is only reached with this off.
+    bool kv_view = true;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute)
+             + (kv_view ? "" : ",kvview=0");
     }
 
     double max_nmse_err() override {
@@ -6467,7 +6472,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], kv_view); // the K tensor is usually a view of the K cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -6481,7 +6486,7 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
             v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], kv_view); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -8938,6 +8943,70 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // decode-shaped flash attention at DK = DV = 128.
+    //
+    // the sweep above skips every non-F16 cache above head size 72, so the shape an AR decode
+    // step presents - one query row, GQA 2:1, head size 128, F32 cache, a permuted (non
+    // contiguous) view of the KV cache - has no coverage. it is also the only shape with a
+    // wave64 kernel (kernel_flash_attn_ext_vec_w64), so this is what says whether that kernel
+    // is right. the kv values straddle its C = 64 block so both the kvpad path and a block
+    // that is only partly masked are exercised.
+    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int kv : {64, 113, 512, 1000, 2048, 2049}) {
+            for (int nr2 : {1, 2}) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            128, 128, 8, {nr2, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                // the decode graph passes a permuted cache view, i.e. nb1 > nb2
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            128, 128, 8, {nr2, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+            }
+        }
+
+        // no mask tensor at all, with and without a kvpad tail. the single no-mask case below
+        // cannot tell the two apart, and a wave64 bug hit both: with nothing writing sm[] after
+        // the zero-init the fully-masked-block skip fired on every block and the kernel returned
+        // all zeros. kv = 64 and 1024 are exact multiples of C = 64 and carry no kvpad tail.
+        for (int kvn : {64, 113, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        128, 128, 8, {1, 1}, kvn, 1, false, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 8, {2, 1}, 1024, 1, false, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+
+        // the exact K/V layout a YuE2 AR decode presents: the cache view has eight head slots and
+        // nothing else, so the key row stride is 8*128 floats and ns10 is 1024. the permuted
+        // cases above allocate a doubled first dimension and so only ever reach ns10 = 2048.
+        // kv past 4096 and past 8192 move the host nsg ladder off 1, which turns on the
+        // cross-simdgroup reduce inside the threadgroup. a song reaches 7,837 cache steps, so
+        // both rungs are on the road to a full run and neither had any coverage.
+        for (int kvn : {225, 226, 256, 1000, 3200, 5000, 9000}) {
+            for (int nr3 : {1, 2}) {
+                auto * tc = new test_flash_attn_ext(
+                        128, 128, 8, {2, nr3}, kvn, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3});
+                tc->kv_view = false;
+                test_cases.emplace_back(tc);
+            }
+        }
+
+        // CFG decodes batch 2, which lives in dim 3 and so stays on the vector path
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 8, {2, 2}, 1000, 1, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}));
+
+        // a few query rows still route to the vector path (the threshold is 20)
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 8, {2, 1}, 1000, 4, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+
+        // the optional features the vector kernels carry function constants for
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 8, {2, 1}, 1000, 1, true, true,  0.0f,  0.0f, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 8, {2, 1}, 1000, 1, true, false, 8.0f,  0.0f, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 8, {2, 1}, 1000, 1, true, false, 0.0f, 10.0f, GGML_PREC_F32, type_KV, type_KV));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    128, 128, 8, {2, 1}, 1000, 1, false, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
     }
 
     // mixed quant and Q1_0 test cases

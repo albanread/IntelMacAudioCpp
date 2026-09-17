@@ -9,7 +9,9 @@
 #include "../module_internal.h"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
+#include <strings.h>
 
 namespace engine::modules {
 namespace {
@@ -294,14 +296,69 @@ struct QKVProjections {
     core::TensorValue v;
 };
 
-bool flash_branches_allowed(const QwenDecoderLayerConfig & config) {
-    // AMD GPUs have no flash attention kernel under Metal: it needs simdgroup matrix multiply,
-    // which is gated on MTLGPUFamilyApple7. Set AUDIOCPP_DISABLE_FLASH_ATTN to take the explicit path.
-    static const bool disabled = getenv("AUDIOCPP_DISABLE_FLASH_ATTN") != nullptr;
-    if (disabled) {
+// Tri-state read of a value-aware environment dial, matching the convention ggml-metal uses for
+// GGML_METAL_MM_W64_DISABLE: unset means "no opinion", and "", "0", "false", "no" and "off" all
+// mean off. A bare presence test would make FLAG=0 turn the thing ON, which silently inverts any
+// A/B run that spells "off" that way.
+enum class FlashEnvDial { Unset, Off, On };
+
+FlashEnvDial read_flash_env_dial(const char * name) {
+    const char * value = getenv(name);
+    if (value == nullptr) {
+        return FlashEnvDial::Unset;
+    }
+    if (value[0] == '\0' ||
+        std::strcmp(value, "0") == 0 ||
+        strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "no") == 0 ||
+        strcasecmp(value, "off") == 0) {
+        return FlashEnvDial::Off;
+    }
+    return FlashEnvDial::On;
+}
+
+// ggml-metal sends a FLASH_ATTN_EXT node to its vector kernel when the query count is below this
+// (ggml_metal_op_flash_attn_ext_use_vec). Mirrored here because it is the seam that decides which
+// kernel family a node lands on, and on a wave64 device only the vector family exists.
+constexpr int64_t kFlashVecMaxQueries = 20;
+
+// Whether this attention region may take a flash-attention branch.
+//
+// One op, two shapes, and they do not have the same backend support. A decode-shaped node - a
+// handful of query rows against a long cache - lowers to ggml-metal's vector flash kernel, which
+// has a wave64 implementation (kernel_flash_attn_ext_vec_w64). A prefill-shaped node lowers to
+// the simdgroup_matrix kernel, which does not, and which ggml_metal_device_supports_op() still
+// refuses on AMD.
+//
+// A single process-wide switch cannot express that. Left set, the decode path never builds a
+// flash node either and there is no win; unset, prefill builds a node the backend refuses and
+// encoding aborts. So the dials are per shape:
+//
+//   AUDIOCPP_DISABLE_FLASH_ATTN   presence test, unchanged - disables every flash branch
+//   AUDIOCPP_FLASH_ATTN_DECODE    value-aware override for decode-shaped nodes
+//   AUDIOCPP_FLASH_ATTN_PREFILL   value-aware override for prefill-shaped nodes
+//
+// An override beats the legacy switch in both directions, so the recipe on a card where only
+// decode is supported is AUDIOCPP_DISABLE_FLASH_ATTN=1 AUDIOCPP_FLASH_ATTN_DECODE=1 (the NAR has
+// its own dial in nar_runtime.cpp and follows the legacy switch too). With nothing set, the
+// behaviour is exactly what it was.
+bool flash_branches_allowed(const QwenDecoderLayerConfig & config, int64_t n_queries) {
+    if (!config.runtime.attention.allow_flash_attention) {
         return false;
     }
-    return config.runtime.attention.allow_flash_attention;
+
+    static const bool         legacy_disabled = getenv("AUDIOCPP_DISABLE_FLASH_ATTN") != nullptr;
+    static const FlashEnvDial decode_dial     = read_flash_env_dial("AUDIOCPP_FLASH_ATTN_DECODE");
+    static const FlashEnvDial prefill_dial    = read_flash_env_dial("AUDIOCPP_FLASH_ATTN_PREFILL");
+
+    const bool decode_shaped = n_queries > 0 && n_queries < kFlashVecMaxQueries;
+
+    const FlashEnvDial dial = decode_shaped ? decode_dial : prefill_dial;
+    if (dial != FlashEnvDial::Unset) {
+        return dial == FlashEnvDial::On;
+    }
+
+    return !legacy_disabled;
 }
 
 QKVProjections build_qkv_projections(
@@ -593,7 +650,7 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build(
     v = core::ensure_backend_addressable_layout(ctx, v);
 
     auto q_heads = TransposeModule({{0, 2, 1, 3}, q.shape.rank}).build(ctx, q);
-    const bool allow_flash = flash_branches_allowed(config_);
+    const bool allow_flash = flash_branches_allowed(config_, q_heads.shape.dims[2]);
     const bool use_prefix_flash =
         allow_flash &&
         prefix_key.has_value() &&
@@ -834,7 +891,7 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build_static_cache_impl(
     auto k_heads = TransposeModule({{0, 2, 1, 3}, attention_key_cache.shape.rank}).build(ctx, attention_key_cache);
     auto v_heads = TransposeModule({{0, 2, 1, 3}, attention_value_cache.shape.rank}).build(ctx, attention_value_cache);
     core::TensorValue context;
-    const bool allow_flash = flash_branches_allowed(config_);
+    const bool allow_flash = flash_branches_allowed(config_, q_heads.shape.dims[2]);
     const bool use_grouped_query =
         config_.runtime.attention.static_mode == QwenDecoderAttentionMode::ManualRepeatThenGroupedQuery &&
         config_.runtime.attention.grouped_query_min_steps > 0 &&
@@ -992,7 +1049,7 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build_with_static_cache_tail_bat
     auto k_heads = TransposeModule({{0, 2, 1, 3}, attention_key_cache.shape.rank}).build(ctx, attention_key_cache);
     auto v_heads = TransposeModule({{0, 2, 1, 3}, attention_value_cache.shape.rank}).build(ctx, attention_value_cache);
     core::TensorValue context;
-    const bool allow_flash = flash_branches_allowed(config_);
+    const bool allow_flash = flash_branches_allowed(config_, q_heads.shape.dims[2]);
     const bool use_grouped_query =
         config_.runtime.attention.static_mode == QwenDecoderAttentionMode::ManualRepeatThenGroupedQuery &&
         config_.runtime.attention.grouped_query_min_steps > 0 &&
