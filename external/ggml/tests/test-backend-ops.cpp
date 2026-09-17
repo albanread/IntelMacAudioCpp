@@ -8401,6 +8401,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
 
+    // wave64 GEMM at TN=4 (kernel_mul_mm_w64_tn4_f16_f32). the host takes it for f16 src0 x f32 src1 with
+    // K % 32 == 0 (bci=0), K <= 128, m >= 1024 and n >= 1024. m is the kernel's row count (64 per tile) and
+    // n its column count (64 per tile at TN=4, 32 at TN=2), so these cover exact and ragged tiles in both,
+    // K = 64 / 96 / 128, broadcast in dims 2 and 3, a strided src0/src1 view, and the edges of the rule.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 1024, 128, { 1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1100, 1030, 128, { 1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1057, 1331,  64, { 2, 1}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1029, 1087,  96, { 3, 2}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1311, 1025, 128, { 4, 1}, {4, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 1100, 128, {16, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1043, 1100, 128, { 1, 1}, {1, 1}, {0, 1, 2, 3}, 192));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 3269, 1602, 128, { 1, 1}, {1, 1}));
+    // just outside the rule, so TN=2: K = 160, m = 1023, n = 1023
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 1024, 160, { 1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1023, 1024, 128, { 1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 1023, 128, { 1, 1}, {1, 1}));
+
 #if 0
     // test the mat-mat path for Metal
     for (int k = 1; k < 512; ++k) {

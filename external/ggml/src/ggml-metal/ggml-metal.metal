@@ -11661,7 +11661,9 @@ template [[host_name("kernel_mul_mm_iq4_xs_f16")]]  kernel mul_mm_t kernel_mul_m
 // NK and TN are template parameters and the staging loops are written generically over
 // both, so the dials the fork sweeps are available - but this backend instantiates a single
 // setting (NK=32, TN=2 => a 64x32 tile) because the shader library is recompiled from source
-// at every device init and every extra variant is paid on every CLI invocation.
+// at every device init and every extra variant is paid on every CLI invocation. the one
+// exception is kernel_mul_mm_w64_tn4_f16_f32 (TN=4, below the instantiation list), which the
+// host selects only for the large small-K QK^T shape where it is measured faster.
 //
 // Threadgroup layout is chosen for the inner loop: sa is k-major so each thread reads its
 // 4 rows as one half4, sb is k-major so its TN columns are one vector load.
@@ -11889,6 +11891,29 @@ template [[host_name("kernel_mul_mm_w64_f16_f32")]]  kernel mul_mm_w64_t kernel_
 template [[host_name("kernel_mul_mm_w64_q8_0_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half,  half4x4,  float, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, 32, 2, 32>;
 template [[host_name("kernel_mul_mm_w64_f32_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<float, float4x4, half,  float4x4,   1, dequantize_f32,  float, float4x4, half,  32, 2, 32>;
 template [[host_name("kernel_mul_mm_w64_f16_f16")]]  kernel mul_mm_w64_t kernel_mul_mm_w64<half,  half4x4,  half,  half4x4,    1, dequantize_f16,  half,  half4x4,  half,  32, 2, 32>;
+
+// TN=4: the SAME template at MM_W64_TN = 4, for f16_f32 only.
+//
+//   tile        : 64 (M) x 64 (N)             MM_W64_NR1 = 16*4
+//   per thread  : 4 x 4 rolled accumulators   NTM = 16 row groups x 16 col groups = 256 threads
+//   stage A     : threads 0..127, ATPR = 2    (unchanged)
+//   stage B     : threads 128..255, BVPT = NK*NR1/128 = 16 values per thread, 2 threads per column
+//   smem        : sa = 32*64*sizeof(half) = 4096, sb = 32*64*sizeof(float) = 8192, total 12288
+//
+// every output element is still one fma chain over k = 0..K-1 of the same staged a and b values,
+// in the same order; the tile only changes which thread owns which element. so the result is
+// byte-identical to kernel_mul_mm_w64_f16_f32 (gemm_bench "stk4": rag, chk and full-shape memcmp).
+// it is faster only where the per-threadgroup cost dominates, i.e. small K. on the Vega II:
+//
+//   QK^T  f16 K [128 x 13552] x f32 Q 5418, ne12=16 (bci=0)    98.35 ms vs 110.61 ms at TN=2
+//   f16 K [2048 x 6144] x f32 5418, ne12=1 (bci=0)              55.17 ms vs  49.87 ms
+//   q8_0 NAR linears                                            +3% .. +46%
+//   AV    f16 V [13552 x 128] x f32 A 5418 (bci=1)              89.92 ms vs  94.71 ms deep in its buffer,
+//                                                               ~37 ms slower at the head of one
+//
+// so the host selects it for bci=0 small-K large shapes only - see ggml_metal_mul_mm_w64_use_tn4()
+// in ggml-metal-device.cpp, whose MM_W64_TN4 and threadgroup memory size must match this.
+template [[host_name("kernel_mul_mm_w64_tn4_f16_f32")]] kernel mul_mm_w64_t kernel_mul_mm_w64<half, half4x4, float, half4x4, 1, dequantize_f16, half, half4x4, float, 32, 4, 32>;
 
 //
 // indirect matrix-matrix multiplication
