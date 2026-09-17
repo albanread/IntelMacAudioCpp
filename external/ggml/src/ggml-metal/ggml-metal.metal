@@ -8471,16 +8471,23 @@ kernel void kernel_flash_attn_ext_vec_reduce_w64(
     const uint64_t rid = tgpig;
 
     const short iwg  = tiisg;
-    const short nsg  = (short) (ntg/NW);
     const bool  live = iwg < NWG;
+
+    // the lanes past NWG still load - a divergent load is not worth the branch - so point them
+    // at partial 0 to keep every address inside the partials, and zero their weight instead.
+    const short iwgr = live ? iwg : 0;
+
+    // max() is insurance, not arithmetic: a zero stride here would hang the GPU, and on this
+    // hardware a GPU hang takes the display with it.
+    const short nsg  = max((short) 1, (short) (ntg/NW));
 
     device const float * ss = (device const float *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    // identity for the lanes that carry no partial: S = 0 contributes nothing to the sum and
-    // M = -FLT_MAX/2 cannot win the max unless every live lane is also empty, in which case
+    // identity for the lanes that carry no partial: weight 0 contributes nothing to either sum,
+    // and M = -FLT_MAX/2 cannot win the max unless every live lane is also empty - in which case
     // the row is all-masked and the zero guard below emits 0 rather than a NaN.
-    float S = live ? ss[rid*(2*NWG) + 2*iwg + 0] : 0.0f;
-    float M = live ? ss[rid*(2*NWG) + 2*iwg + 1] : -FLT_MAX/2;
+    float S = live ? ss[rid*(2*NWG) + 2*iwgr + 0] : 0.0f;
+    float M = live ? ss[rid*(2*NWG) + 2*iwgr + 1] : -FLT_MAX/2;
 
     const float m  = simd_max(M);
     const float ms = live ? exp(M - m) : 0.0f;
@@ -8494,7 +8501,8 @@ kernel void kernel_flash_attn_ext_vec_reduce_w64(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += nsg) {
-        const float4 v = simd_sum(live ? htmp4[i*NWG + iwg]*ms : float4(0.0f));
+        // ms is 0 on the lanes past NWG, so their (in-bounds, real) load contributes nothing
+        const float4 v = simd_sum(htmp4[i*NWG + iwgr]*ms);
 
         if (iwg == 0) {
             dst4[i] = v*S;
