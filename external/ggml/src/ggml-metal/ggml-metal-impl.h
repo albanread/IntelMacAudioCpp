@@ -109,6 +109,11 @@
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
+// the wave64 vec kernel must use C == the wave width: kernel_flash_attn_ext_vec_w64
+// indexes its C-entry score array with a lane id. keep this in sync with the C template
+// argument of kernel_flash_attn_ext_vec_w64 in ggml-metal.metal.
+#define OP_FLASH_ATTN_EXT_VEC_W64_NCPSG 64
+
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
 #define OP_UNARY_NUM_CLAMP      12

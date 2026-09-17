@@ -7939,6 +7939,569 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #undef DV
 }
 
+// ============================================================================================
+// wave64 flash-attention, decode (vec) path
+//
+// kernel_flash_attn_ext_vec above is a 32-lane kernel. the binding reason is not the shuffle
+// ladders, it is the score array: ss[] holds C entries and is indexed with a lane id
+// (ss[tiisg] in the online-softmax step), while mqk[C/NE] is indexed with tx in [0, NL) and
+// NL == NW/NE. both together force
+//
+//     C == NW
+//
+// so a 64-lane kernel must use C = 64, not the 32 that OP_FLASH_ATTN_EXT_VEC_NCPSG names.
+// running the 32-lane kernel on a 64-lane wave is silently wrong (lanes 32..63 of ss[] land
+// in the mask scratch that starts at half-offset 2*C in the same region), which is what the
+// note next to kernel_flash_attn_ext_vec and kernel_flash_attn_ext_blk warns about.
+//
+// this is that kernel re-derived for the probed width. at DK = DV = 128 and NE = 2:
+//
+//     NL = NW/NE = 32 lanes per key, DK4/NL = DV4/NL = 1 float4 per lane
+//
+// i.e. 32 lanes x float4 cover one 128-wide row and one 64-lane wave covers two adjacent keys
+// per instruction, each a 512 B contiguous chunk. that is the mapping a standalone Vega II
+// bench measured as the winner - 1.82x over lane-per-key at S = 8192, K+V at 634 GB/s.
+//
+// deliberate differences from kernel_flash_attn_ext_vec, each one a bug at NW = 64:
+//
+//   1. NW tracks N_SIMDWIDTH and every ladder is generated from NL and NW. the score ladder
+//      reduces the NL lanes that share a key (masks stay below NL so the NE key groups of the
+//      wave never mix); the O ladder folds the NE key groups together (offsets NW/2 .. NL).
+//      the NE-gated ladders upstream encode NL == 32/NE and reduce 8 lanes where 32 are
+//      needed at NW = 64 / NE = 2.
+//
+//   2. the so4 zero-out carries the same o_owner guard as every other so4 write. upstream
+//      leaves it unguarded, which is correct only while tiisg < PV4 - at NW = 64 with
+//      DV4/NL == 1 lanes 32..63 write 32 float4 past the end, into the next simdgroup's
+//      accumulator. it fails only for nsg > 1, so it would pass a single-simdgroup test.
+//
+//   3. masked keys are neutralised before they reach M, S or O. the KV cache the decode path
+//      presents is over-allocated (prefix + a chunk of slack) and the masked tail is never
+//      written, so a masked key can carry uninitialised bits: dot(NaN, q) is NaN,
+//      fma(NaN, scale, -INF) is NaN rather than -INF, and 0*NaN is NaN. the score is selected
+//      on the mask and the V contribution is selected on a zero probability, so neither a NaN
+//      K row nor a NaN V row can reach the accumulators. the fully-masked-block skip only
+//      covers whole blocks; the partial block straddling the end of the valid range is
+//      exactly where this bites.
+//
+// only DK = DV = 128 with F32 or F16 K/V is instantiated - the shapes the decode path
+// presents. ggml_metal_device_supports_op() keeps returning false for everything else, so
+// the non-vec kernel (which does need simdgroup_matrix) is still unreachable here.
+// ============================================================================================
+
+#if N_SIMDWIDTH == 64
+
+template<
+    typename q4_t,  // query type in shared memory
+    typename k4_t,  // key type   (device and shared)
+    typename v4_t,  // value type (device and shared)
+    typename qk_t,  // Q*K type
+    typename s_t,   // soft-max type
+    typename s4_t,
+    typename o4_t,  // attention accumulation type
+    short DK,       // K head size
+    short DV,       // V head size
+    short NE = 2,   // cache elements (keys) per wave
+    short Q  = OP_FLASH_ATTN_EXT_VEC_NQPSG,      // queries per threadgroup
+    short C  = OP_FLASH_ATTN_EXT_VEC_W64_NCPSG>  // cache items per simdgroup - must equal NW
+kernel void kernel_flash_attn_ext_vec_w64(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device const char * pad,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    // the wave width, never a literal. the library is compiled with N_SIMDWIDTH taken from a
+    // hardware probe (ggml-metal-device.m) and every pipeline is asserted against it.
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NL = NW/NE;
+
+    static_assert(DK % 32 == 0, "DK must be divisible by 32");
+    static_assert(DV % 32 == 0, "DV must be divisible by 32");
+    static_assert(NW % NE == 0, "NE must divide the wave width");
+    static_assert(C == NW,      "ss[] is indexed by lane id, so C must equal the wave width");
+    static_assert((DK/4) % NL == 0, "DK4 must be divisible by NL");
+    static_assert((DV/4) % NL == 0, "DV4 must be divisible by NL");
+
+#define NWG  (FC_flash_attn_ext_vec_nwg)
+#define NSG  (FC_flash_attn_ext_vec_nsg)
+
+#define NS10 (FC_flash_attn_ext_vec_ns10)
+#define NS20 (FC_flash_attn_ext_vec_ns20)
+
+    const short iwg = tgpig[2]%NWG;
+
+    const ushort iq3 = tgpig[2]/NWG;
+    const ushort iq2 = tgpig[1];
+    const ushort iq1 = tgpig[0];
+
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+
+    constexpr short PK  = PAD2(DK, 128);
+    constexpr short PK4 = PK/4;
+
+    constexpr short PV  = PAD2(DV, 128);
+    constexpr short PV4 = PV/4;
+
+    constexpr short SH  = 4*C; // shared memory per simdgroup, in halves
+
+    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK); // query
+    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK); // scores
+    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK); // mask
+    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH); // results
+
+    // thread indices inside the simdgroup:
+    //   tx - which DK4/NL slice of the head vector this lane owns
+    //   ty - which of the NE keys of a wave-step this lane is working on
+    const short tx = tiisg%NL;
+    const short ty = tiisg/NL;
+
+    // the O accumulator of this simdgroup is PV4 float4 wide and is owned by the NL lanes with
+    // ty == 0. EVERY write to it must carry this guard, the zero-out included.
+    const bool o_owner = (DV4/NL % NW == 0) || ty == 0;
+
+    so4 += tiisg;
+
+    {
+        q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+
+        // grouped-query broadcast: query head iq2 reads kv head iq2/(ne02/ne_12_2)
+        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+        const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+        k += ikv2*args.nb12 + ikv3*args.nb13;
+        v += ikv2*args.nb22 + ikv3*args.nb23;
+    }
+
+    // load heads from Q to shared memory
+    device const float4 * q4 = (device const float4 *) ((device const char *) q);
+
+    if (iq1 < args.ne01) {
+        for (short i = tiisg; i < PK4; i += NW) {
+            if (i < DK4) {
+                sq4[i] = (q4_t) q4[i];
+            } else {
+                sq4[i] = (q4_t) 0.0f;
+            }
+        }
+    }
+
+    // zero out so
+    if (o_owner) {
+        FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+            so4[ii*NL] = (o4_t) 0.0f;
+        }
+    }
+
+    // zero out the score and mask scratch. sm in particular: when there is no mask tensor
+    // nothing ever writes it, but the score path always reads it.
+    for (short i = tiisg; i < C; i += NW) {
+        ss[i] = (s_t) 0.0f;
+        sm[i] = (half) 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        float S = 0.0f;
+        float M = -FLT_MAX/2;
+
+        // pointer to the mask
+        device const half * pm = (device const half *) (mask + iq1*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+
+        float slope = 1.0f;
+
+        // ALiBi
+        if (FC_flash_attn_ext_vec_has_bias) {
+            const short h = iq2;
+
+            const float base = h < args.n_head_log2 ? args.m0 : args.m1;
+            const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
+
+            slope = pow(base, exph);
+        }
+
+        // loop over the KV cache - each simdgroup handles C columns at a time
+        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
+            int ic = ic0*C;
+            if (ic >= args.ne11) {
+                break;
+            }
+
+            // the last partial chunk uses the pad buffer as source
+            if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11) {
+                k    = pad;
+                v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+                mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+                const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+                const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+                k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
+                v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+
+                if (!FC_flash_attn_ext_vec_has_mask) {
+                    if (ic + tiisg >= args.ne11) {
+                        sm[tiisg] = -MAXHALF;
+                    }
+                } else {
+                    pm = (device const half *) (mask) +
+                        iq1*C +
+                        (iq2%args.ne32)*(C*args.ne31) +
+                        (iq3%args.ne33)*(C*args.ne31*args.ne32);
+                }
+
+                ic = 0;
+            }
+
+            if (FC_flash_attn_ext_vec_has_mask) {
+                sm[tiisg] = pm[ic + tiisg];
+            }
+
+            // skip -INF blocks. this is also what keeps the over-allocated tail of the decode
+            // cache nearly free: a fully masked block costs one C-wide mask read and no K/V
+            // traffic at all.
+            if (simd_max(sm[tiisg]) <= -MAXHALF) {
+                continue;
+            }
+
+            // sm[] is written per lane above and read cross-lane below (sm[NE*tx + ty])
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Q*K^T
+            {
+                device      const k4_t * pk4 = (device const k4_t *) (k + ic*args.nb11);
+                threadgroup const q4_t * pq4 = sq4;
+
+                pk4 += ty*NS10/4 + tx;
+                pq4 += tx;
+
+                qk_t mqk[C/NE] = { [ 0 ... C/NE - 1] = 0.0f };
+
+                // each lane covers DK4/NL float4 of one key row; the NL lanes of a ty group
+                // cover the whole row, and the NE groups of the wave cover NE adjacent keys
+                FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                    FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                        mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 + ii*NL], (float4) pq4[ii*NL]);
+                    }
+
+                    if (NL == NW) {
+                        mqk[cc] = simd_sum(mqk[cc]);
+                    } else {
+                        // reduce the NL lanes that share a key, leaving the group total in
+                        // lane NL*ty. an offset is used iff it is below NL, so the NE key
+                        // groups of the wave never mix. all six tests fold at compile time;
+                        // NL == 32 (NW = 64, NE = 2) keeps the bottom five.
+                        if (NL > 32) { mqk[cc] += simd_shuffle_down(mqk[cc], 32); }
+                        if (NL > 16) { mqk[cc] += simd_shuffle_down(mqk[cc], 16); }
+                        if (NL >  8) { mqk[cc] += simd_shuffle_down(mqk[cc],  8); }
+                        if (NL >  4) { mqk[cc] += simd_shuffle_down(mqk[cc],  4); }
+                        if (NL >  2) { mqk[cc] += simd_shuffle_down(mqk[cc],  2); }
+                        if (NL >  1) { mqk[cc] += simd_shuffle_down(mqk[cc],  1); }
+
+                        // broadcast the group total back over the group
+                        mqk[cc] = simd_shuffle(mqk[cc], NL*ty);
+                    }
+                }
+
+                // this lane stores the score of key NE*tx + ty, whose mask entry is sm[NE*tx + ty]
+                const half mv = sm[NE*tx + ty];
+
+                // a masked key may sit on uninitialised cache memory, so mqk[tx] can be NaN
+                // here and fma(NaN, scale, -INF) is NaN, not -INF. select on the mask.
+                const bool masked = mv <= -MAXHALF;
+
+                qk_t sval;
+
+                if (FC_flash_attn_ext_vec_has_mask &&
+                   !FC_flash_attn_ext_vec_has_scap &&
+                   !FC_flash_attn_ext_vec_has_bias) {
+                    sval = fma(mqk[tx], args.scale, (qk_t) mv);
+                } else {
+                    sval = mqk[tx]*args.scale;
+
+                    if (FC_flash_attn_ext_vec_has_scap) {
+                        sval = args.logit_softcap*precise::tanh(sval);
+                    }
+
+                    if (FC_flash_attn_ext_vec_has_bias) {
+                        sval += (qk_t) mv*slope;
+                    } else {
+                        sval += (qk_t) mv;
+                    }
+                }
+
+                // -FLT_MAX/2 rather than -INFINITY: exp() of the difference underflows to 0
+                // just the same, without depending on infinity arithmetic surviving fast-math.
+                ss[NE*tx + ty] = masked ? (s_t) (-FLT_MAX/2) : (s_t) sval;
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // online softmax
+            {
+                const float m = M;
+                const float s = ss[tiisg];
+
+                M = simd_max(max(M, s));
+
+                const float ms = exp(m - M);
+                const float vs = exp(s - M);
+
+                S = S*ms + simd_sum(vs);
+
+                // the P matrix from the paper (Q rows, C columns)
+                ss[tiisg] = vs;
+
+                // O = diag(ms)*O
+                if (o_owner) {
+                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                        so4[ii*NL] *= ms;
+                    }
+                }
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // O = O + (Q*K^T)*V
+            {
+                o4_t lo[DV4/NL];
+                FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    lo[ii] = 0.0f;
+                }
+
+                device const v4_t * pv4 = (device const v4_t *) (v + ic*args.nb21);
+
+                pv4 += ty*NS20/4 + tx;
+
+                const auto sst = ss + ty;
+
+                FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                    // a zero probability is a masked (or underflowed) key. the V row behind a
+                    // masked key may be uninitialised, so it is selected away rather than
+                    // multiplied by zero - 0*NaN is NaN and would destroy the whole head.
+                    const float ps = (float) sst[cc*NE];
+
+                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                        const float4 vv = (float4) pv4[cc*NE*NS20/4 + ii*NL];
+
+                        lo[ii] += o4_t(ps == 0.0f ? float4(0.0f) : vv*ps);
+                    }
+                }
+
+                // fold the NE key groups of the wave together. an offset is used iff it is at
+                // least NL and still inside the wave, i.e. NW/2 down to NL: one rung at
+                // NW = 64 / NE = 2, two at NW = 32 / NE = 4, none at NE == 1.
+#define FA_W64_O_FOLD(s) \
+                if (NL <= (s) && (s) < NW) {                          \
+                    lo[ii][0] += simd_shuffle_down(lo[ii][0], (s));   \
+                    lo[ii][1] += simd_shuffle_down(lo[ii][1], (s));   \
+                    lo[ii][2] += simd_shuffle_down(lo[ii][2], (s));   \
+                    lo[ii][3] += simd_shuffle_down(lo[ii][3], (s));   \
+                }
+                FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    FA_W64_O_FOLD(32)
+                    FA_W64_O_FOLD(16)
+                    FA_W64_O_FOLD( 8)
+                    FA_W64_O_FOLD( 4)
+                    FA_W64_O_FOLD( 2)
+                    FA_W64_O_FOLD( 1)
+                }
+#undef FA_W64_O_FOLD
+
+                if (o_owner) {
+                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                        so4[ii*NL] += lo[ii];
+                    }
+                }
+            }
+        }
+
+        if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
+            const float m = M;
+            const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+
+            M = simd_max(max(M, s));
+
+            const float ms = exp(m - M);
+            const float vs = exp(s - M);
+
+            S = S*ms + simd_sum(vs);
+
+            if (o_owner) {
+                FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    so4[ii*NL] *= ms;
+                }
+            }
+        }
+
+        // these are needed for reducing the results from the simdgroups (reuse the ss buffer)
+        if (tiisg == 0) {
+            ss[0] = (s_t) S;
+            ss[1] = (s_t) M;
+        }
+    }
+
+    so4 -= tiisg;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // parallel reduce across the simdgroups of this threadgroup
+    for (short r = NSG/2; r > 0; r >>= 1) {
+        if (sgitg < r) {
+            const float S0 = ss[           0];
+            const float S1 = ss[r*(SH/2) + 0];
+
+            const float M0 = ss[           1];
+            const float M1 = ss[r*(SH/2) + 1];
+
+            const float M = max(M0, M1);
+
+            const float ms0 = exp(M0 - M);
+            const float ms1 = exp(M1 - M);
+
+            const float S = S0*ms0 + S1*ms1;
+
+            if (tiisg == 0) {
+                ss[0] = S;
+                ss[1] = M;
+            }
+
+            // O_0 = diag(ms0)*O_0 + diag(ms1)*O_1
+            for (short i = tiisg; i < DV4; i += NW) {
+                so4[i] = so4[i]*ms0 + so4[i + r*PV4]*ms1;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // final rescale with 1/S and store to global memory
+    if (sgitg == 0) {
+        const int64_t nrows = args.ne3*args.ne2*args.ne1;
+        const int64_t rid   = iq3*args.ne2*args.ne1 + iq2 + iq1*args.ne1;
+
+        device float4 * dst4 = (device float4 *) dst;
+        device float  * dst1 = (device float  *) dst + nrows*DV*NWG; // the S and M are stored after the results
+
+        const float S = NWG == 1 ? (ss[0] == 0.0f ? 0.0f : 1.0f/ss[0]) : 1.0f;
+
+        // interleave the workgroup data
+        for (short i = tiisg; i < DV4; i += NW) {
+            dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
+        }
+
+        // store S and M
+        if (NWG > 1) {
+            if (tiisg == 0) {
+                dst1[rid*(2*NWG) + 2*iwg + 0] = ss[0];
+                dst1[rid*(2*NWG) + 2*iwg + 1] = ss[1];
+            }
+        }
+    }
+
+#undef NWG
+#undef NSG
+#undef NS10
+#undef NS20
+}
+
+// same type sets as the 32-lane vec kernel: with an F32 cache only the Q vector is rounded to
+// fp16 on the way into shared memory; K, V, the Q*K products, the soft-max and the O
+// accumulator all stay fp32.
+#define FA_TYPES_W64 \
+           half4,  \
+           half4,  \
+           half4,  \
+    float,         \
+    float, float4, \
+           float4
+
+#define FA_TYPES_W64_F32 \
+           half4,  \
+           float4, \
+           float4, \
+    float,         \
+    float, float4, \
+           float4
+
+typedef decltype(kernel_flash_attn_ext_vec_w64<FA_TYPES_W64, 128, 128, 2>) flash_attn_ext_vec_w64_t;
+
+// only what the decode path asks for. NE = 2 at DK = DV = 128 is lane-per-dim with two keys
+// per wave; do not add a head size without re-checking DK4 % NL and DV4 % NL.
+template [[host_name("kernel_flash_attn_ext_vec_w64_f32_dk128_dv128")]] kernel flash_attn_ext_vec_w64_t kernel_flash_attn_ext_vec_w64<FA_TYPES_W64_F32, 128, 128, 2>;
+template [[host_name("kernel_flash_attn_ext_vec_w64_f16_dk128_dv128")]] kernel flash_attn_ext_vec_w64_t kernel_flash_attn_ext_vec_w64<FA_TYPES_W64,     128, 128, 2>;
+
+#undef FA_TYPES_W64
+#undef FA_TYPES_W64_F32
+
+// the wave64 companion to kernel_flash_attn_ext_vec_reduce.
+//
+// the 32-lane version assumes NW == NWG (iwg == tiisg indexes the NWG partials of one row with
+// a lane id) AND that the threadgroup has exactly NWG simdgroups (the output loop strides by
+// NWG). neither survives at NW = 64: NWG stays 32 because that is what the temp buffer is
+// sized for, and NW*NWG = 2048 threads is over Metal's per-threadgroup limit anyway. so the
+// lanes past NWG are folded in as identity and the output loop strides by the real simdgroup
+// count, taken from the dispatched threadgroup size.
+kernel void kernel_flash_attn_ext_vec_reduce_w64(
+        constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  ntg  [[threads_per_threadgroup]]) {
+#define NWG (FC_flash_attn_ext_vec_reduce_NWG)
+#define DV  (FC_flash_attn_ext_vec_reduce_DV)
+
+    constexpr short NW = N_SIMDWIDTH;
+
+    const uint64_t rid = tgpig;
+
+    const short iwg  = tiisg;
+    const short nsg  = (short) (ntg/NW);
+    const bool  live = iwg < NWG;
+
+    device const float * ss = (device const float *) htmp + (uint64_t)args.nrows*DV*NWG;
+
+    // identity for the lanes that carry no partial: S = 0 contributes nothing to the sum and
+    // M = -FLT_MAX/2 cannot win the max unless every live lane is also empty, in which case
+    // the row is all-masked and the zero guard below emits 0 rather than a NaN.
+    float S = live ? ss[rid*(2*NWG) + 2*iwg + 0] : 0.0f;
+    float M = live ? ss[rid*(2*NWG) + 2*iwg + 1] : -FLT_MAX/2;
+
+    const float m  = simd_max(M);
+    const float ms = live ? exp(M - m) : 0.0f;
+
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+
+    const short DV4 = DV/4;
+
+    device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
+    device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+
+    for (short i = sgitg; i < DV4; i += nsg) {
+        const float4 v = simd_sum(live ? htmp4[i*NWG + iwg]*ms : float4(0.0f));
+
+        if (iwg == 0) {
+            dst4[i] = v*S;
+        }
+    }
+
+#undef NWG
+#undef DV
+}
+
+#endif // N_SIMDWIDTH == 64
+
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,
