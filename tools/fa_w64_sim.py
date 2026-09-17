@@ -290,6 +290,11 @@ if __name__ == "__main__":
             (256,  200,  4,  1, 2, 2),    # 4:1 GQA
             (320,  289,  16, 8, 4, 2),
             (384,  384,  16, 8, 2, 3),
+            # nwg = 32 is what the host actually dispatches; fewer heads to keep it quick
+            (64,   50,   4,  2, 1, 32),
+            (128,  113,  4,  2, 2, 32),
+            (192,  137,  4,  2, 1, 32),
+            (4096, 3000, 4,  2, 2, 32),   # closest to the live decode shape: long, ragged, poisoned
         ]:
             for poison in (False, True):
                 allok &= case(ne11, valid, hq, hkv, nsg, nwg, poison, garbage, seed=ne11 + valid)
