@@ -2155,6 +2155,11 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         dispatch_release(completion_semaphore);
 
         //[cmd_buf waitUntilCompleted];
+
+        // buf_src is +1 from newBufferWithBytesNoCopy and this file builds without ARC. The command buffer has
+        // completed, and it holds unretained references, so it does not own the wrapper: release it here, or one
+        // MTLBuffer (and its wrap of the host pages) leaks per call
+        [buf_src release];
     }
 }
 
@@ -2225,6 +2230,11 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        // buf_dst is +1 from newBufferWithBytesNoCopy and this file builds without ARC. The command buffer has
+        // completed, and it holds unretained references, so it does not own the wrapper: release it here, or one
+        // MTLBuffer (and its wrap of the host pages) leaks per call
+        [buf_dst release];
     }
 }
 
