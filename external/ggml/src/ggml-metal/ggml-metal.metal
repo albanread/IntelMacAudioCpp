@@ -588,12 +588,32 @@ void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg
 
 template <typename type4>
 void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & reg) {
-    device const int8_t * qs = ((device const int8_t *)xb->qs);
+    // Read the four quants as two 16-bit loads instead of four 8-bit ones. Same
+    // arithmetic, half the memory transactions: measured 248 -> 334 GB/s on the
+    // FFN mat-vec shapes of a Radeon Pro Vega II (docs/vega-attention-design.md
+    // records the sweep), reproducing the same finding this fork's llama.cpp
+    // work made on q5_K/q6_K.
+    //
+    // 16 bits is the widest SAFE width here. block_q8_0 is {half d; int8_t qs[32]}
+    // = 34 bytes, so qs lands on byte 34n+2: always 2-byte aligned, but 4-byte
+    // aligned only for odd n. The four quants this call wants start at
+    // 4*(il%4) + 16*(il/4), a multiple of 4 within qs, so both ushorts are in
+    // range and aligned. A ushort2 (or uint) load would require 4-byte alignment
+    // and is NOT safe; an unaligned packed_char4 was measured to buy nothing,
+    // because the frontend decomposes it straight back into byte loads.
+    device const ushort * qs16 =
+        (device const ushort *)(((device const int8_t *)xb->qs) + 4*(il%4) + 16*(il/4));
     const float d = xb->d;
 
-    for (int i = 0; i < 4; i++) {
-        reg[i] = (qs[4*(il%4) + i + 16*(il/4)] * d);
-    }
+    // as_type keeps the quants signed; the int8 -> float conversion and the
+    // multiply are bit-for-bit what the byte-wise loop did.
+    const char2 q01 = as_type<char2>(qs16[0]);
+    const char2 q23 = as_type<char2>(qs16[1]);
+
+    reg[0] = (q01.x * d);
+    reg[1] = (q01.y * d);
+    reg[2] = (q23.x * d);
+    reg[3] = (q23.y * d);
 }
 
 template <typename type4x4>

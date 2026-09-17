@@ -165,10 +165,23 @@ Correctness fixes worth naming, because they were invisible:
 - **`GATED_DELTA_NET`** advertised shapes whose kernel is not instantiated, producing a null
   pipeline that was then dereferenced at encode time.
 
-Apple silicon is unaffected, and that is checked rather than asserted: the shader compiled at
-`-D N_SIMDWIDTH=32` and disassembled gives **965 pre-existing functions, zero differing** against
-the pre-fork baseline, with only the five new `kernel_mul_mm_w64_*` kernels added — and those are
-unreachable there, since `has_mm_w64` requires `!has_simdgroup_mm` and a probed width of 64.
+Apple silicon is unaffected **by the wave64 work**, and that is checked rather than asserted: the
+shader compiled at `-D N_SIMDWIDTH=32` and disassembled gives **965 pre-existing functions, zero
+differing** against the pre-fork baseline, with only the five new `kernel_mul_mm_w64_*` kernels
+added — and those are unreachable there, since `has_mm_w64` requires `!has_simdgroup_mm` and a
+probed width of 64.
+
+**One later change is a deliberate exception and does touch the Apple path:** the q8_0 dequant
+helper `dequantize_q8_0_t4` now reads its quants as two 16-bit loads instead of four 8-bit ones.
+That helper is shared, so at `-D N_SIMDWIDTH=32` **14 functions differ** — the four
+`kernel_mul_mv_ext_q8_0_f32_r1_*` and ten `kernel_flash_attn_ext_vec_q8_0_dk*_dv*`, the latter
+reachable on Apple silicon even though they are dead here. The arithmetic is unchanged and the IR
+says so: same `sext i8` + `air.convert.f.f32.s.i32`, same `fmul` operand order, no vectorised
+multiply, no FMA contraction, no reassociation — only the loads and the byte extraction differ
+(`load i8` 1 → 0, `load <2 x i8>` 0 → 2, and the 4-trip loop unrolled). Verified with a negative
+control: perturbing one constant in an unrelated kernel reports exactly that one function.
+**Not yet executed on Apple silicon** — one `FLASH_ATTN_EXT` run with `type_K/type_V=q8_0` on an
+M-series machine is the missing evidence, and it is cheap there.
 
 ## Before you run anything
 
