@@ -573,15 +573,63 @@ void dequantize_q5_1_t4(device const block_q5_1 * xb, short il, thread type4 & r
 }
 
 template <typename type4x4>
+__attribute__((always_inline))
 void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg) {
-    device const int8_t * qs = ((device const int8_t *)xb->qs);
+    // Read the sixteen quants as eight 16-bit loads instead of sixteen 8-bit
+    // ones: the change dequantize_q8_0_t4 below already made, applied to the
+    // 4x4 helper. Same arithmetic, half the memory transactions. This is the
+    // helper that stages q8_0 weights for the GEMM - kernel_mul_mm_w64_q8_0_f32
+    // carries every q8_0 linear of the YuE2 NAR solve on a Radeon Pro Vega II -
+    // and for get_rows, cpy and the Apple mul_mm/mul_mm_id/flash_attn_ext paths.
+    //
+    // 16 bits is the widest SAFE width here too. block_q8_0 is {half d; int8_t
+    // qs[32]} = 34 bytes, so qs lands on byte 34n+2: always 2-byte aligned, but
+    // 4-byte aligned only for odd n. il is 0 or 1 (QK_NL = 2), so the sixteen
+    // quants this call wants are qs[16*il .. 16*il + 15]: all eight ushorts are
+    // in range, and 16*il is even, so they are aligned. A ushort2 (or uint) load
+    // would require 4-byte alignment and is NOT safe; an unaligned packed_char4
+    // was measured to buy nothing, because the frontend decomposes it straight
+    // back into byte loads.
+    //
+    // always_inline keeps the code shape the byte-wise loop had. Unrolled, the
+    // body is past the frontend inline threshold: without the attribute every
+    // caller (the 8 q8_0 cpy, get_rows, mul_mm, mul_mm_id and mul_mm_w64
+    // kernels, and the 30 flash_attn_ext impls) calls an outlined copy that the
+    // loop version was never split into. A bare inline is not enough.
+    device const ushort * qs16 =
+        (device const ushort *)(((device const int8_t *)xb->qs) + 16*il);
     const float d = xb->d;
 
     float4x4 reg_f;
 
-    for (int i = 0; i < 16; i++) {
-        reg_f[i/4][i%4] = (qs[i + 16*il] * d);
-    }
+    // as_type keeps the quants signed; the int8 -> float conversion, the
+    // multiply and the reg_f[i/4][i%4] layout are bit-for-bit what the
+    // byte-wise loop did. Each name is the (hex) pair of quants it holds.
+    const char2 q01 = as_type<char2>(qs16[0]);
+    const char2 q23 = as_type<char2>(qs16[1]);
+    const char2 q45 = as_type<char2>(qs16[2]);
+    const char2 q67 = as_type<char2>(qs16[3]);
+    const char2 q89 = as_type<char2>(qs16[4]);
+    const char2 qab = as_type<char2>(qs16[5]);
+    const char2 qcd = as_type<char2>(qs16[6]);
+    const char2 qef = as_type<char2>(qs16[7]);
+
+    reg_f[0][0] = (q01.x * d);
+    reg_f[0][1] = (q01.y * d);
+    reg_f[0][2] = (q23.x * d);
+    reg_f[0][3] = (q23.y * d);
+    reg_f[1][0] = (q45.x * d);
+    reg_f[1][1] = (q45.y * d);
+    reg_f[1][2] = (q67.x * d);
+    reg_f[1][3] = (q67.y * d);
+    reg_f[2][0] = (q89.x * d);
+    reg_f[2][1] = (q89.y * d);
+    reg_f[2][2] = (qab.x * d);
+    reg_f[2][3] = (qab.y * d);
+    reg_f[3][0] = (qcd.x * d);
+    reg_f[3][1] = (qcd.y * d);
+    reg_f[3][2] = (qef.x * d);
+    reg_f[3][3] = (qef.y * d);
 
     reg = (type4x4) reg_f;
 }
