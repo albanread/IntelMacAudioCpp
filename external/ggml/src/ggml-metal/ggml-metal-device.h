@@ -288,6 +288,10 @@ ggml_metal_device_t ggml_metal_device_get(int device);
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
+// wraps the pages containing [data, data + size) in a zero-copy shared MTLBuffer, retained (the caller releases it)
+// returns NULL if they cannot be wrapped or GGML_METAL_NO_ZEROCOPY is set; *offs receives the offset of data inside it
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, size_t size, size_t * offs); // id<MTLBuffer>
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset);

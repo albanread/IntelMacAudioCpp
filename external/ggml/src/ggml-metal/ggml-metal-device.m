@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <string.h>  // strcmp
 #include <strings.h> // strcasecmp
+#include <unistd.h>  // sysconf
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -2035,6 +2036,37 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
 
+// wrap a host pointer in a zero-copy shared MTLBuffer
+// newBufferWithBytesNoCopy requires a page-aligned address and length, so wrap the containing
+// pages and report the offset of the data within the wrapped range. returns nil if the memory
+// cannot be wrapped (e.g. malloc'd memory spanning multiple VM regions) - callers must fall
+// back to a staged copy in that case
+static id<MTLBuffer> ggml_metal_buffer_wrap_host(id<MTLDevice> device, const void * data, size_t size, size_t * offs) {
+    // escape hatch for bisecting: force the staged-copy path
+    if (getenv("GGML_METAL_NO_ZEROCOPY") != NULL) {
+        return nil;
+    }
+
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+
+    const uintptr_t addr    = (uintptr_t) data;
+    const uintptr_t addr_lo = addr & ~(page - 1);
+
+    const size_t len = (size_t)(((addr - addr_lo) + size + page - 1) & ~(page - 1));
+
+    *offs = (size_t)(addr - addr_lo);
+
+    return [device newBufferWithBytesNoCopy:(void *)(uintptr_t) addr_lo
+                                     length:len
+                                    options:MTLResourceStorageModeShared
+                                deallocator:nil];
+}
+
+// the same wrap for callers outside this file (the async get_tensor path in ggml-metal-context.m)
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, size_t size, size_t * offs) {
+    return ggml_metal_buffer_wrap_host(dev->mtl_device, data, size, offs);
+}
+
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     if (buf->is_shared) {
         memset((char *) tensor->data + offset, value, size);
@@ -2052,7 +2084,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, bid_dst.offs + size)
+                          range:NSMakeRange(bid_dst.offs, size)
                           value:value];
 
             [encoder endEncoding];
@@ -2071,17 +2103,48 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
     @autoreleasepool {
         // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        size_t offs_src = 0;
 
-        GGML_ASSERT(buf_src);
+        id<MTLBuffer> buf_src = ggml_metal_buffer_wrap_host(buf->dev->mtl_device, data, size, &offs_src);
 
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
+
+        // the host memory could not be wrapped zero-copy - stage the copy through a shared buffer
+        if (buf_src == nil) {
+            const size_t size_step = MIN(size, (size_t) 64u*1024*1024);
+
+            id<MTLBuffer> buf_stg = [buf->dev->mtl_device newBufferWithLength:size_step options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_stg);
+
+            for (size_t i = 0; i < size; i += size_step) {
+                const size_t size_cur = MIN(size_step, size - i);
+
+                memcpy([buf_stg contents], (const char *) data + i, size_cur);
+
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+
+                {
+                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                    [encoder copyFromBuffer:buf_stg
+                               sourceOffset:0
+                                   toBuffer:bid_dst.metal
+                          destinationOffset:bid_dst.offs + i
+                                       size:size_cur];
+
+                    [encoder endEncoding];
+                }
+
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+            }
+
+            [buf_stg release];
+
+            return;
+        }
 
         // note: for experimentation purposes, here we use a semaphore to wait for the copy to complete
         //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference
@@ -2093,7 +2156,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder copyFromBuffer:buf_src
-                       sourceOffset:0
+                       sourceOffset:offs_src
                            toBuffer:bid_dst.metal
                   destinationOffset:bid_dst.offs
                                size:size];
@@ -2114,6 +2177,11 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         dispatch_release(completion_semaphore);
 
         //[cmd_buf waitUntilCompleted];
+
+        // buf_src is +1 from newBufferWithBytesNoCopy and this file builds without ARC. The command buffer has
+        // completed, and it holds unretained references, so it does not own the wrapper: release it here, or one
+        // MTLBuffer (and its wrap of the host pages) leaks per call
+        [buf_src release];
     }
 }
 
@@ -2129,12 +2197,44 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         bid_src.offs += offset;
 
         // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        size_t offs_dst = 0;
 
-        GGML_ASSERT(buf_dst);
+        id<MTLBuffer> buf_dst = ggml_metal_buffer_wrap_host(buf->dev->mtl_device, data, size, &offs_dst);
+
+        // the host memory could not be wrapped zero-copy - stage the copy through a shared buffer
+        if (buf_dst == nil) {
+            const size_t size_step = MIN(size, (size_t) 64u*1024*1024);
+
+            id<MTLBuffer> buf_stg = [buf->dev->mtl_device newBufferWithLength:size_step options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_stg);
+
+            for (size_t i = 0; i < size; i += size_step) {
+                const size_t size_cur = MIN(size_step, size - i);
+
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+
+                {
+                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                    [encoder copyFromBuffer:bid_src.metal
+                               sourceOffset:bid_src.offs + i
+                                   toBuffer:buf_stg
+                          destinationOffset:0
+                                       size:size_cur];
+
+                    [encoder endEncoding];
+                }
+
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+
+                memcpy((char *) data + i, [buf_stg contents], size_cur);
+            }
+
+            [buf_stg release];
+
+            return;
+        }
 
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
@@ -2144,7 +2244,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
             [encoder copyFromBuffer:bid_src.metal
                        sourceOffset:bid_src.offs
                            toBuffer:buf_dst
-                  destinationOffset:0
+                  destinationOffset:offs_dst
                                size:size];
 
             [encoder endEncoding];
@@ -2152,6 +2252,11 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        // buf_dst is +1 from newBufferWithBytesNoCopy and this file builds without ARC. The command buffer has
+        // completed, and it holds unretained references, so it does not own the wrapper: release it here, or one
+        // MTLBuffer (and its wrap of the host pages) leaks per call
+        [buf_dst release];
     }
 }
 
