@@ -356,14 +356,18 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 }
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
 
-        GGML_ASSERT(buf_dst);
+        // newBufferWithBytesNoCopy needs a page-aligned address and length, so wrap the pages that contain
+        // the destination and blit to the offset of the data inside them
+        size_t offs_dst = 0;
+
+        id<MTLBuffer> buf_dst = (id<MTLBuffer>) ggml_metal_device_wrap_host(ctx->dev, data, size, &offs_dst);
 
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
         if (bid_src.metal == nil) {
@@ -375,13 +379,53 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+        // the host memory could not be wrapped zero-copy - stage the read through a shared buffer
+        // the host copy of a chunk must wait until its blit has completed, so this path is synchronous:
+        // each chunk is still queued behind any ongoing GPU operations, and its command buffer is
+        // recorded like the zero-copy one, so ggml_metal_synchronize checks its status the same way
+        if (buf_dst == nil) {
+            const size_t size_step = MIN(size, (size_t) 64u*1024*1024);
+
+            id<MTLBuffer> buf_stg = [device newBufferWithLength:size_step options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_stg);
+
+            for (size_t i = 0; i < size; i += size_step) {
+                const size_t size_cur = MIN(size_step, size - i);
+
+                id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                [encoder copyFromBuffer:bid_src.metal
+                           sourceOffset:bid_src.offs + i
+                               toBuffer:buf_stg
+                      destinationOffset:0
+                                   size:size_cur];
+
+                [encoder endEncoding];
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+
+                memcpy((char *) data + i, [buf_stg contents], size_cur);
+
+                [ctx->cmd_bufs_ext addObject:cmd_buf];
+                ctx->cmd_buf_last = cmd_buf;
+
+                [cmd_buf retain];
+            }
+
+            [buf_stg release];
+
+            return;
+        }
+
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
         [encoder copyFromBuffer:bid_src.metal
                    sourceOffset:bid_src.offs
                        toBuffer:buf_dst
-              destinationOffset:0
+              destinationOffset:offs_dst
                            size:size];
 
         [encoder endEncoding];

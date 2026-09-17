@@ -2040,6 +2040,11 @@ static id<MTLBuffer> ggml_metal_buffer_wrap_host(id<MTLDevice> device, const voi
                                 deallocator:nil];
 }
 
+// the same wrap for callers outside this file (the async get_tensor path in ggml-metal-context.m)
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, size_t size, size_t * offs) {
+    return ggml_metal_buffer_wrap_host(dev->mtl_device, data, size, offs);
+}
+
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     if (buf->is_shared) {
         memset((char *) tensor->data + offset, value, size);
