@@ -8174,10 +8174,18 @@ kernel void kernel_flash_attn_ext_vec_w64(
                 sm[tiisg] = pm[ic + tiisg];
             }
 
-            // skip -INF blocks. this is also what keeps the over-allocated tail of the decode
-            // cache nearly free: a fully masked block costs one C-wide mask read and no K/V
-            // traffic at all.
-            if (simd_max(sm[tiisg]) <= -MAXHALF) {
+            // skip fully -INF blocks. this is also what keeps the over-allocated tail of the
+            // decode cache nearly free: a fully masked block costs one C-wide mask read and
+            // no K/V traffic at all.
+            //
+            // the reduction is taken in float, and that cast is load-bearing. simd_max() over
+            // a half operand is mis-lowered at wave64 by this AMD Metal compiler: it can
+            // return a value <= -MAXHALF when every lane demonstrably holds 0, which skips
+            // live blocks. it is silent - the per-key mask select still zeroes real masked
+            // keys, so the output stays finite and plausible, just computed over a fraction
+            // of the cache. with no mask tensor at all (sm[] written once by the zero-init
+            // and never again) it fires on every block and the kernel returns all zeros.
+            if (simd_max((float) sm[tiisg]) <= -(float) MAXHALF) {
                 continue;
             }
 
