@@ -270,12 +270,17 @@ wave64 flash attn     = true
 
 - **`CPY` and `CONT` fail with sentinel mismatches** — out-of-bounds *writes* — on permuted
   f32/f16/bf16 copies and on `i32 CONT` with `use_view_slice=1`. These fail **identically before and
-  after** every change here, so they are pre-existing, not introduced. They are still real.
+  after** every change here, so they are pre-existing, not introduced. They are still real, and more
+  suspect now: `CONCAT` had a bug of exactly this class (below), and it corrupted real output.
 - **AR decode is 5% slower** than before the port, outside the 0.4% noise floor. The concurrency
   gate is the suspect.
 - **`mm_min` is unmeasured.** Upstream's 8 was tuned for Apple tile shapes, not a 64×32 tile.
-- **Runs are not bit-reproducible.** Four fixed-seed runs differ, but at SNR 62.3 dB and correlation
-  0.999999712 — reduction-order floating point, inaudible. It was 30–35% of samples before.
+- ~~**Runs are not bit-reproducible.**~~ **Fixed, and the earlier explanation was wrong.** Fixed-seed
+  runs used to differ at SNR ~62 dB. That was attributed here to reduction-order floating point. The
+  real cause was `kernel_concat`: it was float-only while `supports_op` admitted every type, so the NAR's
+  f16 K/V concatenation copied 4 bytes at a 2-byte stride and raced at the seam between its two
+  sources, 896 times per song. With a typed `kernel_concat`, same-seed runs are **byte-identical** (3/3 at
+  1,600 frames, 2/2 at 5,400).
 - Only YuE2 has been exercised. Only one GPU. Only macOS.
 
 ## Licence and attribution
