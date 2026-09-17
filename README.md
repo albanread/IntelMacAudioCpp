@@ -262,6 +262,7 @@ wave64 flash attn     = true
 | `AUDIOCPP_FLASH_ATTN_NAR` | value-aware; same for the NAR stage. Leave unset on AMD |
 | `GGML_METAL_FA_W64_DISABLE` | value-aware; turns the wave64 flash kernels off at the ggml layer, so `supports_op` goes back to refusing. The A/B dial for the flash path |
 | `GGML_METAL_MM_W64_DISABLE` | fall back to mat-vec. **The** A/B dial: width stays 64, only GEMM selection changes |
+| `GGML_METAL_MM_W64_TN4_DISABLE` | value-aware; keeps the NAR QK^T GEMM (f16 x f32, `bci=0`, K <= 128, both sides >= 1024) on the TN=2 kernel instead of `kernel_mul_mm_w64_tn4_f16_f32`. Same bytes either way; speed A/B only |
 | `GGML_METAL_MM_MIN` | mat-vec → mat-mul crossover. Still upstream's 8, **unmeasured** on this card |
 | `GGML_METAL_CONCURRENCY_ENABLE` | re-enable concurrent dispatch on non-Apple GPUs |
 | `GGML_METAL_N_CB` | command buffers per graph |

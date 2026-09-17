@@ -729,6 +729,25 @@ QwenDecoderLayerOutputs QwenDecoderLayerModule::build(
             ctx,
             TransposeModule({{0, 2, 1, 3}, all_v.shape.rank}).build(ctx, all_v),
             kv_repeats);
+        // QK^T input layout. K needs nothing here: MatMulModule re-transposes K^T, the two
+        // (0,1,3,2) permutes cancel, and src0 arrives with contiguous strides. Q does: it is the
+        // (0,2,1,3) view of the RoPE output, so src1 walks steps at nb11 = heads*dim*4 bytes
+        // (8192 for Yue2's 16x128) instead of dim*4. Every other Q in this file, the static-cache
+        // path and the Yue2 NAR velocity graph (nar_runtime.cpp mixed_attention) already make Q
+        // contiguous before attention; the eager prefill was the one that did not. Apart from K's
+        // dtype, it is the only input-layout difference between the prefix-state QK^T and the
+        // velocity QK^T in the Vega dump.
+        //
+        // Metal only, because there the copy is arithmetic-neutral: kernel_mul_mm_w64 and the
+        // simdgroup mat-mat and mat-vec kernels read src1 through nb11/nb12/nb13 and y[k] within
+        // a row (nb10 is 4 either way), and kernel selection (ggml_is_transposed, nb10, ne) does
+        // not change, so the same values accumulate in the same order. (The Metal-4 tensor-API
+        // mat-mat hands nb11 to matmul2d as a stride; that path is not proven bit-identical.)
+        // On the CPU backend a contiguous src1 moves mul_mat onto llamafile_sgemm / BLAS, a
+        // different reduction order, so CPU graphs are left as they were.
+        if (ctx.backend_type == core::BackendType::Metal) {
+            q_heads = core::ensure_backend_addressable_layout(ctx, q_heads);
+        }
         context = attention_from_heads(ctx, q_heads, k_heads, v_heads, dim, attention_mask);
     }
     if (config_.activation_cast.enabled && config_.activation_cast.after_attention) {

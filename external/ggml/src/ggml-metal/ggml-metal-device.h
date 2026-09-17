@@ -257,6 +257,11 @@ struct ggml_metal_device_props {
     // kernel_mul_mm_w64 instead of kernel_mul_mm
     bool has_mm_w64;
 
+    // the TN=4 variant of that GEMM (kernel_mul_mm_w64_tn4_f16_f32) may be selected for the shapes
+    // ggml_metal_mul_mm_w64_use_tn4() admits. byte-identical to TN=2, so a speed dial only
+    // (GGML_METAL_MM_W64_TN4_DISABLE). never true without has_mm_w64.
+    bool has_mm_w64_tn4;
+
     // wave64 devices get kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 for the decode-shaped
     // flash-attention nodes. the non-vec kernels still need simdgroup_matrix and stay off.
     bool has_fa_vec_w64;

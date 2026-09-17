@@ -904,6 +904,27 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 }
             }
 
+            // the TN=4 GEMM variant (kernel_mul_mm_w64_tn4_f16_f32) for the large small-K f16_f32
+            // shapes ggml_metal_mul_mm_w64_use_tn4() admits - the NAR QK^T. it is the same kernel at a
+            // wider tile and gives the same bytes, so this only ever changes speed. it rides on the GEMM:
+            // MM_W64_DISABLE turns it off too.
+            dev->props.has_mm_w64_tn4 = dev->props.has_mm_w64;
+            // value-aware, like GGML_METAL_MM_W64_DISABLE: "", "0", "false", "no", "off" all mean
+            // not disabled, so TN4_DISABLE=0 cannot silently invert an A/B.
+            {
+                const char * s = getenv("GGML_METAL_MM_W64_TN4_DISABLE");
+                if (s && !(s[0] == 0 ||
+                           strcmp(s, "0") == 0 ||
+                           strcasecmp(s, "false") == 0 ||
+                           strcasecmp(s, "no") == 0 ||
+                           strcasecmp(s, "off") == 0)) {
+                    if (dev->props.has_mm_w64_tn4) {
+                        GGML_LOG_INFO("%s: GGML_METAL_MM_W64_TN4_DISABLE=%s - wave64 mat-mul TN=4 off, using TN=2\n", __func__, s);
+                    }
+                    dev->props.has_mm_w64_tn4 = false;
+                }
+            }
+
             // wave64 devices also get their own flash-attention vec kernels
             // (kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 in ggml-metal.metal), which are
             // only compiled into the library when N_SIMDWIDTH == 64. same necessary conditions
@@ -1151,6 +1172,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
             GGML_LOG_INFO("%s: simd group width      = %d\n", __func__, dev->props.simd_width);
             GGML_LOG_INFO("%s: wave64 mat-mul        = %s\n", __func__, dev->props.has_mm_w64             ? "true" : "false");
+            GGML_LOG_INFO("%s: wave64 mat-mul TN=4   = %s\n", __func__, dev->props.has_mm_w64_tn4         ? "true" : "false");
             GGML_LOG_INFO("%s: wave64 flash attn     = %s\n", __func__, dev->props.has_fa_vec_w64         ? "true" : "false");
             GGML_LOG_INFO("%s: mat-mul min batch     = %d (id: %d)\n", __func__, dev->props.mm_min, dev->props.mm_id_min);
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");

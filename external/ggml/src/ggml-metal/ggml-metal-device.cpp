@@ -7,6 +7,7 @@
 
 #include "ggml-impl.h"
 
+#include <atomic>
 #include <cassert>
 #include <memory>
 #include <string>
@@ -819,6 +820,24 @@ static_assert(MM_W64_NK % 16 == 0,
         "stage A dequantizes 16 k at a time, so a staging step must be a whole number of those - "
         "this is also what lets bc_inp be expressed as K % MM_W64_NK");
 
+// the TN=4 variant: the same template instantiated at MM_W64_TN = 4 for f16_f32 only
+// (kernel_mul_mm_w64_tn4_f16_f32 in ggml-metal.metal). NK, TM and NR0 are shared with TN=2.
+static constexpr int MM_W64_TN4     = 4;               // cols of C per thread
+static constexpr int MM_W64_NR1_TN4 = 16*MM_W64_TN4;   // cols of C per threadgroup (N)
+
+// host mirrors of the kernel's stage-B static_asserts, at both TN: the NK x NR1 staging tile splits
+// across the NUM_THREADS/2 stage-B threads, and each thread's run of BVPT = NK*NR1/(NUM_THREADS/2)
+// k stays inside one column of sb. with the tile assert these bound every sb index the kernel
+// writes by NK*NR1, which is what the host sizes sb as.
+static_assert((MM_W64_NR0/MM_W64_TM)*(MM_W64_NR1_TN4/MM_W64_TN4) == MM_W64_NUM_THREADS,
+        "the w64 TN=4 C tile must be covered by exactly MM_W64_NUM_THREADS threads, one TM x TN patch each");
+static_assert((MM_W64_NK*MM_W64_NR1)     % (MM_W64_NUM_THREADS/2) == 0 &&
+              MM_W64_NK % ((MM_W64_NK*MM_W64_NR1)    /(MM_W64_NUM_THREADS/2)) == 0,
+        "w64 TN=2 stage B: the NK x NR1 tile must split into whole in-column runs across the staging threads");
+static_assert((MM_W64_NK*MM_W64_NR1_TN4) % (MM_W64_NUM_THREADS/2) == 0 &&
+              MM_W64_NK % ((MM_W64_NK*MM_W64_NR1_TN4)/(MM_W64_NUM_THREADS/2)) == 0,
+        "w64 TN=4 stage B: the NK x NR1 tile must split into whole in-column runs across the staging threads");
+
 // size in bytes of ONE threadgroup staging element, for ONE operand. kernel_mul_mm_w64 has two
 // independent staging types - S0 stages A (src0) into sa, S1 stages B (src1) into sb - and they
 // are chosen per operand, not as a pair. keep this in step with the instantiation list in
@@ -845,6 +864,43 @@ static_assert(MM_W64_NK % 16 == 0,
 static size_t ggml_metal_mul_mm_w64_stage_size(ggml_type t) {
     return t == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
 }
+
+// whether a MUL_MAT node on the w64 GEMM takes the TN=4 variant (kernel_mul_mm_w64_tn4_f16_f32).
+//
+// TN=4 is the same kernel at a 64 x 64 tile: every output element is the same fma chain over the same
+// staged values in the same k order, so the bytes do not change and this is purely a speed question.
+// gemm_bench measured it on the Vega II (ms per dispatch, TN=4 vs TN=2):
+//
+//   f16_f32 bci=0  K =  128, 13552 x 5418 x 16  (the NAR velocity QK^T)    98.35 vs 110.61   win
+//   f16_f32 bci=0  K = 2048,  6144 x 5418 x  1                              55.17 vs  49.87   loss
+//   q8_0_f32 NAR linears, K = 2048 / 6144                                   +3% .. +46%       loss
+//   f16_f32 bci=1  (the NAR AV)                    loses 37 ms when src1 sits at the head of its buffer
+//
+// TN=4 covers the same outputs with half the threadgroups, but every K step does 16 fma into 16
+// accumulators instead of 8. at K = 128 a threadgroup is only 4 steps, so halving the threadgroup count
+// wins; at K = 2048 (64 steps) the heavier step loses. the predicate stays inside the measured win:
+//
+//   - f16 src0 x f32 src1, bci == 0: the QK^T orientation. AV (bci == 1) depends on buffer placement
+//     nothing guarantees, and every q8_0 shape loses, so they stay at TN=2. f16_f32 is also the only
+//     pair with a TN=4 instantiation.
+//   - ne00 <= 128: K no larger than the measured win. the one measured large-K f16_f32 shape loses.
+//   - ne01 >= 1024 and ne11 >= 1024: large dispatches only. the tile grows in N alone, so with N >= 1024
+//     the up-to-32 extra discarded columns of a ragged last tile are at most ~3% of the work. every NAR
+//     QK^T from N1600 up (3269 x 1602) qualifies; N400's 869 x 402 (0.56 ms/dispatch) stays at TN=2.
+static bool ggml_metal_mul_mm_w64_use_tn4(const ggml_tensor * op, bool bc_inp) {
+    return op->src[0]->type  == GGML_TYPE_F16 &&
+           op->src[1]->type  == GGML_TYPE_F32 &&
+           !bc_inp &&
+           op->src[0]->ne[0] <= 128  &&
+           op->src[0]->ne[1] >= 1024 &&
+           op->src[1]->ne[1] >= 1024;
+}
+
+// set once the TN=4 pipeline is refused - it failed to build, or it cannot take the MM_W64_NUM_THREADS
+// threads it is dispatched with. falling back is always safe, because TN=2 gives the same bytes; the
+// flag only keeps a refused pipeline from being retried and logged on every node. it is process-wide,
+// so a refusal on one device keeps every device at TN=2.
+static std::atomic<bool> g_mm_w64_tn4_refused { false };
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
@@ -882,23 +938,67 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, use_w64 ? "kernel_mul_mm_w64_%s_%s" : "kernel_mul_mm_%s_%s",
-             ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
+    // the cached pipeline for base/name, compiled with this node's function constants on first use.
+    // the constants are the same for every variant of the family, TN=4 included.
+    const auto get_pipeline = [&](const char * pbase, const char * pname) {
+        ggml_metal_pipeline_with_params p = ggml_metal_library_get_pipeline(lib, pname);
+        if (!p.pipeline) {
+            ggml_metal_cv_t cv = ggml_metal_cv_init();
 
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        ggml_metal_cv_t cv = ggml_metal_cv_init();
+            ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+            ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+            ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
+            ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
+            ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+            ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
 
-        ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
-        ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
-        ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
-        ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
-        ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
-        ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
+            p = ggml_metal_library_compile_pipeline(lib, pbase, pname, cv);
 
-        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+            ggml_metal_cv_free(cv);
+        }
+        return p;
+    };
+
+    // cols of C per thread in the w64 kernel: MM_W64_TN, or MM_W64_TN4 for the shapes
+    // ggml_metal_mul_mm_w64_use_tn4() admits
+    int w64_tn = MM_W64_TN;
+
+    ggml_metal_pipeline_with_params res = {};
+
+    if (use_w64 && props->has_mm_w64_tn4 && ggml_metal_mul_mm_w64_use_tn4(op, bc_inp) &&
+            !g_mm_w64_tn4_refused.load(std::memory_order_relaxed)) {
+        snprintf(base, 256, "kernel_mul_mm_w64_tn4_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+        snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+                 base, bc_inp, bc_out, ne12, ne13, r2, r3);
+
+        res = get_pipeline(base, name);
+
+        // pipeline-width safety, as in gemm_bench: ggml_metal_op_mul_mat dispatches exactly
+        // MM_W64_NUM_THREADS threads per threadgroup, so a pipeline that cannot take that many is never
+        // used. fall back to TN=2 (same bytes) instead of aborting.
+        const int max_threads = res.pipeline ? ggml_metal_pipeline_max_theads_per_threadgroup(res) : 0;
+        if (max_threads >= MM_W64_NUM_THREADS) {
+            w64_tn = MM_W64_TN4;
+        } else {
+            if (!g_mm_w64_tn4_refused.exchange(true)) {
+                if (res.pipeline) {
+                    GGML_LOG_WARN("%s: %s has maxTotalThreadsPerThreadgroup = %d < %d - using the TN=2 kernel\n",
+                            __func__, name, max_threads, MM_W64_NUM_THREADS);
+                } else {
+                    GGML_LOG_WARN("%s: %s is unavailable - using the TN=2 kernel\n", __func__, name);
+                }
+            }
+            res = {};
+        }
+    }
+
+    if (w64_tn == MM_W64_TN) {
+        snprintf(base, 256, use_w64 ? "kernel_mul_mm_w64_%s_%s" : "kernel_mul_mm_%s_%s",
+                 ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+        snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+                 base, bc_inp, bc_out, ne12, ne13, r2, r3);
+
+        res = get_pipeline(base, name);
 
         // note: there is deliberately no fallback to kernel_mul_mm here. on wave64 hardware the
         //       simdgroup_matrix kernel does not merely underperform, it fails at PIPELINE
@@ -907,8 +1007,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         //       w64 variant on the mat-vec path, so reaching this assert means those two lists
         //       have drifted apart.
         GGML_ASSERT((res.pipeline || !use_w64) && "missing wave64 mat-mul variant for this type pair");
-
-        ggml_metal_cv_free(cv);
     }
 
     if (has_tensor) {
@@ -918,29 +1016,33 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else if (use_w64) {
-        // MM_W64_NR0 rows x MM_W64_NR1 cols of C per threadgroup (a 64 x 32 tile as shipped)
+        // MM_W64_NR0 rows x NR1 = 16*TN cols of C per threadgroup: a 64 x 32 tile as shipped, 64 x 64
+        // for the TN=4 variant. the kernel's MM_W64_NR1 is (16*MM_W64_TN) for the TN it was instantiated at.
+        const int nr1 = w64_tn == MM_W64_TN4 ? MM_W64_NR1_TN4 : MM_W64_NR1;
+
         res.nr0 = MM_W64_NR0;
-        res.nr1 = MM_W64_NR1;
+        res.nr1 = nr1;
 
         // the same expression the kernel uses to lay out threadgroup memory:
         //   sa = shmem,                                   [MM_W64_NK][MM_W64_NR0] of S0
         //   sb = shmem + MM_W64_NR0*MM_W64_NK*sizeof(S0), [MM_W64_NK][MM_W64_NR1] of S1
         // the two halves are sized independently, one per operand, so sa and sb can differ:
         //
-        //   variant     S0     S1       sa     sb    smem
-        //   f32_f32     float  float  8192   4096   12288
-        //   f16_f32     half   float  4096   4096    8192
-        //   q8_0_f32    half   float  4096   4096    8192
-        //   f32_f16     float  half   8192   2048   10240
-        //   f16_f16     half   half   4096   2048    6144
+        //   variant      S0     S1       sa     sb    smem
+        //   f32_f32      float  float  8192   4096   12288
+        //   f16_f32      half   float  4096   4096    8192
+        //   q8_0_f32     half   float  4096   4096    8192
+        //   f32_f16      float  half   8192   2048   10240
+        //   f16_f16      half   half   4096   2048    6144
+        //   tn4_f16_f32  half   float  4096   8192   12288   (NR1 = 64)
         //
-        // all five are under Metal's guaranteed 16 KB minimum; ggml_metal_op_mul_mat asserts
+        // all six are under Metal's guaranteed 16 KB minimum; ggml_metal_op_mul_mat asserts
         // the result against this device's real max_theadgroup_memory_size before encoding.
         const size_t sz_a = ggml_metal_mul_mm_w64_stage_size(tsrc0);
         const size_t sz_b = ggml_metal_mul_mm_w64_stage_size(tsrc1);
 
         res.smem = (size_t) MM_W64_NK*MM_W64_NR0*sz_a
-                 + (size_t) MM_W64_NK*MM_W64_NR1*sz_b;
+                 + (size_t) MM_W64_NK*nr1*sz_b;
     } else {
         res.nr0 = 64;
         res.nr1 = 32;
