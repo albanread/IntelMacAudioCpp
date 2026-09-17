@@ -183,6 +183,21 @@ control: perturbing one constant in an unrelated kernel reports exactly that one
 **Not yet executed on Apple silicon** — one `FLASH_ATTN_EXT` run with `type_K/type_V=q8_0` on an
 M-series machine is the missing evidence, and it is cheap there.
 
+**A second exception of the same kind:** the 4x4 q8_0 helper `dequantize_q8_0` now reads its
+sixteen quants as eight 16-bit loads instead of sixteen 8-bit ones. On the Vega II it stages the
+weights for `kernel_mul_mm_w64_q8_0_f32`, the GEMM behind every q8_0 linear of the YuE2 NAR solve.
+It is shared with Apple-reachable kernels, so at both `-D N_SIMDWIDTH=32` and `64` **38 functions
+differ** and no others. They are `kernel_cpy_q8_0_f{32,16}`, `kernel_get_rows_q8_0`,
+`kernel_mul_mm_q8_0_f{32,16}`, `kernel_mul_mm_id_q8_0_f{32,16}`, `kernel_mul_mm_w64_q8_0_f32`, and
+the 30 `kernel_flash_attn_ext_impl` instantiations behind the 15 `kernel_flash_attn_ext_q8_0_dk*_dv*`
+kernels. The same negative control holds. At each call site the IR goes `load i8` 1 → 0 and
+`load <2 x i8>` 0 → 8. The `sext i8` + `air.convert.f.f32.s.i32` + scalar `fmul` (convert, d) is
+unchanged, with no vectorised multiply and no FMA. Unrolled, the body crossed the frontend inline
+threshold and was outlined at every call site, so the helper carries `always_inline` to keep the
+inlined shape the loop had. A bare `inline` was not enough. **Not yet executed anywhere.** The
+missing evidence is correctness and speed on the Vega II, plus a q8_0 `MUL_MAT` / `GET_ROWS` /
+`FLASH_ATTN_EXT` run on an M-series machine.
+
 ## Before you run anything
 
 > [!CAUTION]
