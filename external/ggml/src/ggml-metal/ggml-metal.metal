@@ -7977,8 +7977,11 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 //
 //   2. the so4 zero-out carries the same o_owner guard as every other so4 write. upstream
 //      leaves it unguarded, which is correct only while tiisg < PV4 - at NW = 64 with
-//      DV4/NL == 1 lanes 32..63 write 32 float4 past the end, into the next simdgroup's
-//      accumulator. it fails only for nsg > 1, so it would pass a single-simdgroup test.
+//      DV4/NL == 1 lanes 32..63 write 32 float4 past the end of this simdgroup's PV4-wide
+//      region. for sgitg < NSG-1 that lands in the next simdgroup's accumulator (both are
+//      storing zero at that moment, so the value survives, but it is a race by construction);
+//      for the last simdgroup it lands past the end of the threadgroup allocation. an
+//      out-of-bounds threadgroup write is the failure mode that takes the display with it.
 //
 //   3. masked keys are neutralised before they reach M, S or O. the KV cache the decode path
 //      presents is over-allocated (prefix + a chunk of slack) and the masked tail is never
@@ -8069,7 +8072,8 @@ kernel void kernel_flash_attn_ext_vec_w64(
     const short ty = tiisg/NL;
 
     // the O accumulator of this simdgroup is PV4 float4 wide and is owned by the NL lanes with
-    // ty == 0. EVERY write to it must carry this guard, the zero-out included.
+    // ty == 0. EVERY write to it must carry this guard, the zero-out included - without it the
+    // last simdgroup writes past the end of the threadgroup allocation.
     const bool o_owner = (DV4/NL % NW == 0) || ty == 0;
 
     so4 += tiisg;
