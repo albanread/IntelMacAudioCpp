@@ -8716,8 +8716,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int dim : { 0, 1, 2, 3, }) {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {11, 12, 13, 14}, 7, dim, v));
+            test_cases.emplace_back(new test_concat(GGML_TYPE_I16, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+
+    // f16 K/V concat at the YuE2 NAR shape: AR prefix-state K (8134 positions) ++ NAR K (5418 positions),
+    // head_dim 128, 8 kv heads, along the position axis. Every size here is a multiple of the 32-byte
+    // buffer alignment, so the seam element and the element past the output both border a sentinel.
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {128, 8, 8134, 1}, 5418, 2, 0));
 
     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
