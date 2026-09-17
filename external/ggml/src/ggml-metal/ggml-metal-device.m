@@ -1410,8 +1410,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_VIEW:
         case GGML_OP_TRANSPOSE:
         case GGML_OP_PERMUTE:
-        case GGML_OP_CONCAT:
             return true;
+        case GGML_OP_CONCAT:
+            // kernel_concat is instantiated for these element types only (kernel_concat_<type>)
+            return op->src[0]->type == op->type && op->src[1]->type == op->type &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 ||
+                    op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_I16);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
             return ggml_metal_op_bin_default_supported(op) ||
