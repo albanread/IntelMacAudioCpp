@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-ops.h" // ggml_metal_op_flash_attn_ext_use_vec_w64
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -1336,6 +1337,7 @@ static bool ggml_metal_type_supported_at_simd_width(ggml_metal_device_t dev, enu
 
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
+    const bool has_fa_vec_w64          = dev->props.has_fa_vec_w64;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
     const int  simd_width              = dev->props.simd_width;
@@ -1535,7 +1537,20 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 default:
                     return false;
             }
-            return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+            if (has_simdgroup_mm) {
+                return true;
+            }
+
+            // wave64 devices have no simdgroup_matrix, so kernel_flash_attn_ext_impl and
+            // kernel_flash_attn_ext_blk stay out of reach and prefill-shaped nodes keep
+            // answering no. the decode-shaped vec nodes do have a wave64 kernel
+            // (kernel_flash_attn_ext_vec_w64), so admit exactly the shapes it is instantiated
+            // for - by the same predicate ggml_metal_op_flash_attn_ext() uses to select it,
+            // so the two can never disagree.
+            //
+            // Apple silicon never reaches this line: has_simdgroup_mm is true there and
+            // has_fa_vec_w64 requires it to be false.
+            return has_fa_vec_w64 && ggml_metal_op_flash_attn_ext_use_vec_w64(op);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;

@@ -6332,17 +6332,18 @@ kernel void kernel_flash_attn_ext_blk(
     const int32_t Q = FC_flash_attn_ext_blk_nqptg;
     const int32_t C = FC_flash_attn_ext_blk_ncpsg;
 
-    // note: all four flash-attention kernels - kernel_flash_attn_ext_blk,
-    //       kernel_flash_attn_ext_impl, kernel_flash_attn_ext_vec and
-    //       kernel_flash_attn_ext_vec_reduce - assume 32-lane waves. none of them is
-    //       wave64-aware, which is why NW is pinned to 32 here instead of tracking
-    //       N_SIMDWIDTH. they are unreachable on this card only because
-    //       ggml_metal_device_supports_op() returns has_simdgroup_mm for
-    //       GGML_OP_FLASH_ATTN_EXT (ggml-metal-device.m), and has_simdgroup_mm is false on
-    //       AMD. that is a capability check which happens to exclude this card - it is NOT a
-    //       wave-width check, and it is NOT the audio.cpp-level AUDIOCPP_DISABLE_FLASH_ATTN
-    //       switch, which is a separate dial and not what makes any of this safe.
-    //       do not loosen that gate until all four kernels are ported to the probed width.
+    // note: this kernel assumes 32-lane waves, which is why NW is pinned to 32 here instead
+    //       of tracking N_SIMDWIDTH. it stays unreachable on a wave64 device.
+    //       ggml_metal_device_supports_op() (ggml-metal-device.m) admits
+    //       GGML_OP_FLASH_ATTN_EXT on either of two grounds: has_simdgroup_mm, which is false
+    //       on AMD, or has_fa_vec_w64 AND ggml_metal_op_flash_attn_ext_use_vec_w64() - a
+    //       decode-shaped node at DK = DV = 128 with an F32/F16 cache, which routes to
+    //       kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 and never to this kernel.
+    //       neither ground is a wave-width check, and neither is the audio.cpp-level
+    //       AUDIOCPP_DISABLE_FLASH_ATTN switch, which is a separate dial.
+    //       do not widen what supports_op admits without a kernel at the probed width behind
+    //       it. kernel_flash_attn_ext_impl (simdgroup_matrix) and kernel_flash_attn_ext_blk
+    //       have none, so prefill-shaped nodes must keep falling back to another backend.
     //       on 32-wide devices NW == 32 is identical to N_SIMDWIDTH.
     constexpr short NW  = 32;
 
@@ -6477,17 +6478,18 @@ void kernel_flash_attn_ext_impl(
     constexpr short PV8  = PV/8;
   //constexpr short PV16 = PV/16;
 
-    // note: all four flash-attention kernels - kernel_flash_attn_ext_blk,
-    //       kernel_flash_attn_ext_impl, kernel_flash_attn_ext_vec and
-    //       kernel_flash_attn_ext_vec_reduce - assume 32-lane waves. none of them is
-    //       wave64-aware, which is why NW is pinned to 32 here instead of tracking
-    //       N_SIMDWIDTH. they are unreachable on this card only because
-    //       ggml_metal_device_supports_op() returns has_simdgroup_mm for
-    //       GGML_OP_FLASH_ATTN_EXT (ggml-metal-device.m), and has_simdgroup_mm is false on
-    //       AMD. that is a capability check which happens to exclude this card - it is NOT a
-    //       wave-width check, and it is NOT the audio.cpp-level AUDIOCPP_DISABLE_FLASH_ATTN
-    //       switch, which is a separate dial and not what makes any of this safe.
-    //       do not loosen that gate until all four kernels are ported to the probed width.
+    // note: this kernel assumes 32-lane waves, which is why NW is pinned to 32 here instead
+    //       of tracking N_SIMDWIDTH. it stays unreachable on a wave64 device.
+    //       ggml_metal_device_supports_op() (ggml-metal-device.m) admits
+    //       GGML_OP_FLASH_ATTN_EXT on either of two grounds: has_simdgroup_mm, which is false
+    //       on AMD, or has_fa_vec_w64 AND ggml_metal_op_flash_attn_ext_use_vec_w64() - a
+    //       decode-shaped node at DK = DV = 128 with an F32/F16 cache, which routes to
+    //       kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 and never to this kernel.
+    //       neither ground is a wave-width check, and neither is the audio.cpp-level
+    //       AUDIOCPP_DISABLE_FLASH_ATTN switch, which is a separate dial.
+    //       do not widen what supports_op admits without a kernel at the probed width behind
+    //       it. kernel_flash_attn_ext_impl (simdgroup_matrix) and kernel_flash_attn_ext_blk
+    //       have none, so prefill-shaped nodes must keep falling back to another backend.
     //       on 32-wide devices NW == 32 is identical to N_SIMDWIDTH.
     constexpr short NW  = 32;
     constexpr short NQ  = Q/NSG;
@@ -7349,17 +7351,18 @@ kernel void kernel_flash_attn_ext_vec(
     constexpr short PV  = PAD2(DV, 128);
     constexpr short PV4 = PV/4;
 
-    // note: all four flash-attention kernels - kernel_flash_attn_ext_blk,
-    //       kernel_flash_attn_ext_impl, kernel_flash_attn_ext_vec and
-    //       kernel_flash_attn_ext_vec_reduce - assume 32-lane waves. none of them is
-    //       wave64-aware, which is why NW is pinned to 32 here instead of tracking
-    //       N_SIMDWIDTH. they are unreachable on this card only because
-    //       ggml_metal_device_supports_op() returns has_simdgroup_mm for
-    //       GGML_OP_FLASH_ATTN_EXT (ggml-metal-device.m), and has_simdgroup_mm is false on
-    //       AMD. that is a capability check which happens to exclude this card - it is NOT a
-    //       wave-width check, and it is NOT the audio.cpp-level AUDIOCPP_DISABLE_FLASH_ATTN
-    //       switch, which is a separate dial and not what makes any of this safe.
-    //       do not loosen that gate until all four kernels are ported to the probed width.
+    // note: this kernel assumes 32-lane waves, which is why NW is pinned to 32 here instead
+    //       of tracking N_SIMDWIDTH. it stays unreachable on a wave64 device.
+    //       ggml_metal_device_supports_op() (ggml-metal-device.m) admits
+    //       GGML_OP_FLASH_ATTN_EXT on either of two grounds: has_simdgroup_mm, which is false
+    //       on AMD, or has_fa_vec_w64 AND ggml_metal_op_flash_attn_ext_use_vec_w64() - a
+    //       decode-shaped node at DK = DV = 128 with an F32/F16 cache, which routes to
+    //       kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 and never to this kernel.
+    //       neither ground is a wave-width check, and neither is the audio.cpp-level
+    //       AUDIOCPP_DISABLE_FLASH_ATTN switch, which is a separate dial.
+    //       do not widen what supports_op admits without a kernel at the probed width behind
+    //       it. kernel_flash_attn_ext_impl (simdgroup_matrix) and kernel_flash_attn_ext_blk
+    //       have none, so prefill-shaped nodes must keep falling back to another backend.
     //       on 32-wide devices NW == 32 is identical to N_SIMDWIDTH.
     constexpr short NW  = 32;
     constexpr short NL  = NW/NE; // note: this can be adjusted to support different head sizes and simdgroup work loads
@@ -7905,10 +7908,12 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     const uint64_t rid = tgpig;
 
-    // note: the fourth flash-attention kernel, and it assumes 32-lane waves too - iwg == tiisg
-    //       indexes the NWG <= 32 partial results of one row directly, and the simd_max/simd_sum
-    //       below reduce across exactly those lanes. see the note in kernel_flash_attn_ext_blk
-    //       for why this is unreachable today and what must not be loosened.
+    // note: assumes 32-lane waves too - iwg == tiisg indexes the NWG <= 32 partial results of
+    //       one row directly, the simd_max/simd_sum below reduce across exactly those lanes,
+    //       and the output loop strides by NWG because the threadgroup has NWG simdgroups.
+    //       the wave64 companion is kernel_flash_attn_ext_vec_reduce_w64, which cannot just
+    //       retarget NW: see the note there. this one stays unreachable on wave64 for the
+    //       reason given in kernel_flash_attn_ext_blk.
     const short iwg = tiisg;
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
