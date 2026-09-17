@@ -183,6 +183,33 @@ control: perturbing one constant in an unrelated kernel reports exactly that one
 **Not yet executed on Apple silicon** — one `FLASH_ATTN_EXT` run with `type_K/type_V=q8_0` on an
 M-series machine is the missing evidence, and it is cheap there.
 
+**A second exception of the same kind:** the 4x4 q8_0 helper `dequantize_q8_0` now reads its
+sixteen quants as eight 16-bit loads instead of sixteen 8-bit ones. On the Vega II it stages the
+weights for `kernel_mul_mm_w64_q8_0_f32`, the GEMM behind every q8_0 linear of the YuE2 NAR solve.
+It is shared with Apple-reachable kernels, so at both `-D N_SIMDWIDTH=32` and `64` **38 functions
+differ** and no others. They are `kernel_cpy_q8_0_f{32,16}`, `kernel_get_rows_q8_0`,
+`kernel_mul_mm_q8_0_f{32,16}`, `kernel_mul_mm_id_q8_0_f{32,16}`, `kernel_mul_mm_w64_q8_0_f32`, and
+the 30 `kernel_flash_attn_ext_impl` instantiations behind the 15 `kernel_flash_attn_ext_q8_0_dk*_dv*`
+kernels. The same negative control holds. At each call site the IR goes `load i8` 1 → 0 and
+`load <2 x i8>` 0 → 8. The `sext i8` + `air.convert.f.f32.s.i32` + scalar `fmul` (convert, d) is
+unchanged, with no vectorised multiply and no FMA. Unrolled, the body crossed the frontend inline
+threshold and was outlined at every call site, so the helper carries `always_inline` to keep the
+inlined shape the loop had. A bare `inline` was not enough.
+
+**Executed and measured on the Vega II.** Output is bit-identical to the previous build: a hash
+probe of `kernel_mul_mm_w64_q8_0_f32` at the four NAR linear shapes with 5,418 rows, plus
+`get_rows` and `cpy` q8_0, matches the previous build exactly, and a negative control
+(`GGML_METAL_MM_W64_DISABLE=1`) changes every hash. `test-backend-ops` MUL_MAT is 955/955 on both
+builds with identical per-test results, GET_ROWS q8_0 4/4, and the SUM and CPY controls are
+unchanged. The q8_0 GEMM goes from 2.62 to 3.13 TFLOP/s (1.196x). At song-shaped length (5,400
+frames, `cot=off`) the NAR stage goes from 194.6 s to 178.2 s (-8.5%), with the semantic stage and
+VAE unchanged. Carried over to the full `cot=full` song, that projects NAR 230.7 s -> ~211 s.
+
+**Still not executed on Apple silicon.** On Apple silicon the IR also changes shape, though not
+arithmetic: in the 15 NSG=8 `kernel_flash_attn_ext_impl` instantiations the mask pointer now lives
+in a stack slot. Nothing here shows whether Apple's backend re-promotes it. Before anyone relies on
+it, run q8_0 `MUL_MAT`, `GET_ROWS` and `FLASH_ATTN_EXT` on an M-series machine.
+
 ## Before you run anything
 
 > [!CAUTION]
