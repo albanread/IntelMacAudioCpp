@@ -903,6 +903,35 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 }
             }
 
+            // wave64 devices also get their own flash-attention vec kernels
+            // (kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 in ggml-metal.metal), which are
+            // only compiled into the library when N_SIMDWIDTH == 64. same necessary conditions
+            // as the GEMM: the raw probe must have said 64 so a failed probe's 32-lane fallback
+            // can never arm a 64-lane kernel, and the compiled width must agree.
+            //
+            // this prop says "the kernels exist". whether a given node can use them is a
+            // per-node shape question - see ggml_metal_op_flash_attn_ext_use_vec_w64().
+            dev->props.has_fa_vec_w64 =
+                !dev->props.has_simdgroup_mm &&
+                dev->simd_width_probed == 64 &&
+                dev->props.simd_width  == 64;
+            // value-aware, like GGML_METAL_MM_W64_DISABLE and unlike a bare presence test:
+            // FA_W64_DISABLE=0 silently inverting an A/B is exactly the failure this avoids.
+            // "", "0", "false", "no", "off" all mean off.
+            {
+                const char * s = getenv("GGML_METAL_FA_W64_DISABLE");
+                if (s && !(s[0] == 0 ||
+                           strcmp(s, "0") == 0 ||
+                           strcasecmp(s, "false") == 0 ||
+                           strcasecmp(s, "no") == 0 ||
+                           strcasecmp(s, "off") == 0)) {
+                    if (dev->props.has_fa_vec_w64) {
+                        GGML_LOG_INFO("%s: GGML_METAL_FA_W64_DISABLE=%s - wave64 flash-attention off, FLASH_ATTN_EXT falls back to another backend\n", __func__, s);
+                    }
+                    dev->props.has_fa_vec_w64 = false;
+                }
+            }
+
             // mat-vec -> mat-mul crossover. 8 and 32 are the upstream defaults, tuned on Apple
             // GPUs; on this card the fork measured batching only becoming cheap above ~32, so
             // these want sweeping per device rather than inheriting.

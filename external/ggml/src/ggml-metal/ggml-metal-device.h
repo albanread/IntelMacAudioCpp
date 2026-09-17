@@ -203,13 +203,15 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_scap,
         bool    has_kvpad,
         int32_t nsg,
-        int32_t nwg);
+        int32_t nwg,
+        bool    w64);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         int32_t dv,
-        int32_t nwg);
+        int32_t nwg,
+        bool    w64);
 
 // MTLResidencySet wrapper
 
@@ -253,6 +255,10 @@ struct ggml_metal_device_props {
     // wave64 devices have no simdgroup_matrix support, so they get the register-tiled
     // kernel_mul_mm_w64 instead of kernel_mul_mm
     bool has_mm_w64;
+
+    // wave64 devices get kernel_flash_attn_ext_vec_w64 / _vec_reduce_w64 for the decode-shaped
+    // flash-attention nodes. the non-vec kernels still need simdgroup_matrix and stay off.
+    bool has_fa_vec_w64;
 
     // the src1 batch size above which MUL_MAT / MUL_MAT_ID take the mat-mul kernel instead of
     // the mat-vec one. the defaults are Apple's; the crossover sits elsewhere on other hardware,
