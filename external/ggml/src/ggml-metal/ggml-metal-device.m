@@ -1151,6 +1151,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
             GGML_LOG_INFO("%s: simd group width      = %d\n", __func__, dev->props.simd_width);
             GGML_LOG_INFO("%s: wave64 mat-mul        = %s\n", __func__, dev->props.has_mm_w64             ? "true" : "false");
+            GGML_LOG_INFO("%s: wave64 flash attn     = %s\n", __func__, dev->props.has_fa_vec_w64         ? "true" : "false");
             GGML_LOG_INFO("%s: mat-mul min batch     = %d (id: %d)\n", __func__, dev->props.mm_min, dev->props.mm_id_min);
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");

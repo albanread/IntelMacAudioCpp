@@ -198,9 +198,13 @@ Other traps:
   weights to host RAM over PCIe. Never set it on a discrete card.
 - **Exit code 0 proves nothing.** A run can exit clean, write a plausible file size and the right
   duration, and still be a full-scale square wave. Check RMS, full-scale count and level count.
-- Flash attention has **no wave64 kernel** in this tree or upstream. `FLASH_ATTN_EXT` is gated on
-  `simdgroup_matrix` and aborts rather than falling back, so AMD runs need
-  `AUDIOCPP_DISABLE_FLASH_ATTN=1`.
+- Flash attention is **half ported**. The decode-shaped path now has wave64 kernels
+  (`kernel_flash_attn_ext_vec_w64` / `_vec_reduce_w64`) and `ggml_metal_device_supports_op()`
+  admits exactly those nodes. The prefill-shaped path still lowers to the `simdgroup_matrix`
+  kernel, has no wave64 kernel, and still aborts rather than falling back. So an AMD run needs
+  `AUDIOCPP_DISABLE_FLASH_ATTN=1` to keep prefill and the NAR explicit, plus
+  `AUDIOCPP_FLASH_ATTN_DECODE=1` to let AR decode take the flash branch. **Unmeasured on hardware
+  at the time of writing** - verify with `test-backend-ops` on `FLASH_ATTN_EXT` first.
 
 ## Usage
 
@@ -217,6 +221,7 @@ selected device: AMD Radeon Pro Vega II
 simdgroup matrix mul. = false
 simd group width      = 64
 wave64 mat-mul        = true
+wave64 flash attn     = true
 ```
 
 ### Dials
@@ -224,7 +229,11 @@ wave64 mat-mul        = true
 | variable | what it does |
 |---|---|
 | `GGML_METAL_DEVICE` | select GPU by name substring or index |
-| `AUDIOCPP_DISABLE_FLASH_ATTN` | required on AMD |
+| `AUDIOCPP_DISABLE_FLASH_ATTN` | presence test; disables every flash branch. Still required on AMD to keep prefill and the NAR off the unported `simdgroup_matrix` kernel |
+| `AUDIOCPP_FLASH_ATTN_DECODE` | value-aware; overrides the above for decode-shaped attention. Set to `1` on AMD to take the wave64 flash path |
+| `AUDIOCPP_FLASH_ATTN_PREFILL` | value-aware; same for prefill-shaped attention. Leave unset on AMD |
+| `AUDIOCPP_FLASH_ATTN_NAR` | value-aware; same for the NAR stage. Leave unset on AMD |
+| `GGML_METAL_FA_W64_DISABLE` | value-aware; turns the wave64 flash kernels off at the ggml layer, so `supports_op` goes back to refusing. The A/B dial for the flash path |
 | `GGML_METAL_MM_W64_DISABLE` | fall back to mat-vec. **The** A/B dial: width stays 64, only GEMM selection changes |
 | `GGML_METAL_MM_MIN` | mat-vec → mat-mul crossover. Still upstream's 8, **unmeasured** on this card |
 | `GGML_METAL_CONCURRENCY_ENABLE` | re-enable concurrent dispatch on non-Apple GPUs |

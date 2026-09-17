@@ -18,10 +18,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <strings.h>
 #include <utility>
 
 namespace engine::models::yue2 {
@@ -263,10 +265,31 @@ core::TensorValue repeat_kv_heads(core::ModuleBuildContext & ctx, const core::Te
 }
 
 namespace {
-// The Metal flash kernel needs simdgroup matrix multiply, which is gated on MTLGPUFamilyApple7, so
-// AMD GPUs do not have it. This lets the explicit path below be used instead.
+// The NAR attends over the whole sequence at once, so its flash node is prefill-shaped and lowers
+// to ggml-metal's simdgroup_matrix kernel. There is no wave64 implementation of that one, so on
+// AMD this stage must stay on the explicit path even when the AR decode path takes flash - and it
+// needs a dial of its own to say so, because the AR decode path is turned on by overriding the
+// shared AUDIOCPP_DISABLE_FLASH_ATTN switch.
+//
+//   AUDIOCPP_DISABLE_FLASH_ATTN  presence test, unchanged
+//   AUDIOCPP_FLASH_ATTN_NAR      value-aware override ("", "0", "false", "no", "off" mean off),
+//                                which beats the switch above in both directions
+//
+// Note the NAR is also structurally incapable of reaching the vector kernel: ggml-metal picks it
+// only when the query count is under 20 and the NAR's is the whole frame count. This dial is the
+// belt to that braces.
 bool flash_attn_disabled() {
-    static const bool disabled = getenv("AUDIOCPP_DISABLE_FLASH_ATTN") != nullptr;
+    static const bool disabled = [] {
+        const char * value = getenv("AUDIOCPP_FLASH_ATTN_NAR");
+        if (value != nullptr) {
+            return value[0] == '\0' ||
+                   std::strcmp(value, "0") == 0 ||
+                   strcasecmp(value, "false") == 0 ||
+                   strcasecmp(value, "no") == 0 ||
+                   strcasecmp(value, "off") == 0;
+        }
+        return getenv("AUDIOCPP_DISABLE_FLASH_ATTN") != nullptr;
+    }();
     return disabled;
 }
 }  // namespace
