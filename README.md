@@ -164,6 +164,20 @@ Correctness fixes worth naming, because they were invisible:
   wave-generic and still work.
 - **`GATED_DELTA_NET`** advertised shapes whose kernel is not instantiated, producing a null
   pipeline that was then dereferenced at encode time.
+- **`kernel_concat`** was float-only while `supports_op` admitted every type. f16 K/V were copied 4
+  bytes at a 2-byte stride, which raced at the seam between the two sources and wrote 2 bytes past
+  the output. This was the source of run-to-run output differences. It is now typed, and same-seed
+  runs are byte-identical.
+- **Host copies on a discrete GPU.** Upstream `set_tensor`/`get_tensor` wrap the raw host pointer with
+  `newBufferWithBytesNoCopy`, which needs a page-aligned address and length. On macOS 26.6.2 that
+  aborts (`GGML_ASSERT(buf_src)`) for a 200 MiB unaligned upload and for a zero-length async read.
+  These copies now wrap the containing pages and fall back to a staged copy in 64 MiB chunks, ported
+  from this project's llama.cpp fork (`GGML_METAL_NO_ZEROCOPY` forces the fallback). Two further
+  changes the fork does not have: the async read path is covered too, and the wrapper is now
+  **released**. ggml-metal builds without ARC, and every synchronous copy leaked one Metal buffer. At
+  1,600 frames that was **+3.6 GiB of the Vega's system memory** in use (+1.2 MiB fixed), and the
+  peak footprint drops from 1,275 to 861 MiB. `memset_tensor` also passed an end offset where a
+  length belongs, and overwrote memory past the tensor. Output is byte-identical before and after.
 
 Apple silicon is unaffected **by the wave64 work**, and that is checked rather than asserted: the
 shader compiled at `-D N_SIMDWIDTH=32` and disassembled gives **965 pre-existing functions, zero
