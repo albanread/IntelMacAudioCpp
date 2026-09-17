@@ -2165,12 +2165,44 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         bid_src.offs += offset;
 
         // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        size_t offs_dst = 0;
 
-        GGML_ASSERT(buf_dst);
+        id<MTLBuffer> buf_dst = ggml_metal_buffer_wrap_host(buf->dev->mtl_device, data, size, &offs_dst);
+
+        // the host memory could not be wrapped zero-copy - stage the copy through a shared buffer
+        if (buf_dst == nil) {
+            const size_t size_step = MIN(size, (size_t) 64u*1024*1024);
+
+            id<MTLBuffer> buf_stg = [buf->dev->mtl_device newBufferWithLength:size_step options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_stg);
+
+            for (size_t i = 0; i < size; i += size_step) {
+                const size_t size_cur = MIN(size_step, size - i);
+
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+
+                {
+                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                    [encoder copyFromBuffer:bid_src.metal
+                               sourceOffset:bid_src.offs + i
+                                   toBuffer:buf_stg
+                          destinationOffset:0
+                                       size:size_cur];
+
+                    [encoder endEncoding];
+                }
+
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+
+                memcpy((char *) data + i, [buf_stg contents], size_cur);
+            }
+
+            [buf_stg release];
+
+            return;
+        }
 
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
@@ -2180,7 +2212,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
             [encoder copyFromBuffer:bid_src.metal
                        sourceOffset:bid_src.offs
                            toBuffer:buf_dst
-                  destinationOffset:0
+                  destinationOffset:offs_dst
                                size:size];
 
             [encoder endEncoding];
